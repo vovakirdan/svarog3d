@@ -8,64 +8,91 @@
 
 use anyhow::Result;
 use winit::{
-    dpi::PhysicalSize,
-    event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::WindowBuilder,
+    application::ApplicationHandler,
+    dpi::{LogicalSize, PhysicalSize},
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::{Window, WindowId},
 };
 
-/// Run a basic window with minimal event handling.
-/// Returns when the window is closed.
+/// Public entry: runs a basic window loop (returns on close).
 pub fn run_basic_window() -> Result<()> {
-    // Create event loop (new API with Result return).
+    // New API: EventLoop::new() -> Result<...>
     let event_loop: EventLoop<()> = EventLoop::new().expect("Failed to create event loop");
 
-    let window = WindowBuilder::new()
-        .with_title("Svarog3D")
-        .with_inner_size(PhysicalSize::new(1280_u32, 720_u32))
-        .build(&event_loop)
-        .expect("Failed to create window");
+    // Our app state implementing ApplicationHandler
+    let mut app = App::default();
 
-    log::info!(
-        "Window created: {}x{}",
-        window.inner_size().width,
-        window.inner_size().height
-    );
-
-    // No continuous redraws for A1; keep CPU low at idle.
-    event_loop
-        .run(move |event, window_target| {
-            match event {
-                Event::WindowEvent { event, .. } => {
-                    match event {
-                        WindowEvent::CloseRequested => {
-                            log::info!("Close requested. Exiting event loop.");
-                            window_target.exit();
-                        }
-                        WindowEvent::Resized(new_size) => {
-                            log::info!("Resized: {}x{}", new_size.width, new_size.height);
-                            // We'll pass this to the renderer in next steps.
-                        }
-                        WindowEvent::ScaleFactorChanged { scale_factor, new_inner_size } => {
-                            log::info!(
-                                "Scale factor changed: {:.3}, new_inner_size={}x{}",
-                                scale_factor,
-                                new_inner_size.width,
-                                new_inner_size.height
-                            );
-                            // In future we will reconfigure the surface here.
-                        }
-                        _ => {}
-                    }
-                }
-                Event::AboutToWait => {
-                    // Place to request redraw when we have a renderer:
-                    // window.request_redraw();
-                }
-                _ => {}
-            }
-        })
-        .map_err(|e| anyhow::anyhow!("Event loop error: {e:?}"))?;
-
+    // Run until exit()
+    event_loop.run_app(&mut app).map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
     Ok(())
+}
+
+/// Simple app state for step A1.
+#[derive(Default)]
+struct App {
+    window: Option<Window>,
+}
+
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // Create a window with attributes (replacement for WindowBuilder).
+        let attrs = Window::default_attributes()
+            .with_title("Svarog3D")
+            .with_inner_size(LogicalSize::new(1280.0_f64, 720.0_f64));
+
+        let window = event_loop
+            .create_window(attrs)
+            .expect("Failed to create window");
+
+        log::info!(
+            "Window created: {}x{} (physical pixels)",
+            window.inner_size().width,
+            window.inner_size().height
+        );
+
+        // Keep CPU low at idle: don't request redraws yet.
+        event_loop.set_control_flow(ControlFlow::Wait);
+
+        self.window = Some(window);
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        match event {
+            WindowEvent::CloseRequested => {
+                log::info!("Close requested. Exiting.");
+                event_loop.exit();
+            }
+            WindowEvent::Resized(new_size) => {
+                log::info!("Resized: {}x{}", new_size.width, new_size.height);
+                // In next steps we'll reconfigure the surface here.
+            }
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                inner_size_writer: _,
+            } => {
+                log::info!(
+                    "Scale factor changed: {:.3}",
+                    scale_factor
+                );
+                // Future: surface reconfig. For now we only log.
+            }
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // No continuous redraws in A1. When renderer appears,
+        // we'll call `window.request_redraw()` here as needed.
+        if let Some(w) = &self.window {
+            // placeholder: nothing; keep CPU low
+            let _size: PhysicalSize<u32> = w.inner_size();
+            let _ = _size; // silence unused for now
+        }
+    }
 }
