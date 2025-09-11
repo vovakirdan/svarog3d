@@ -7,6 +7,7 @@
 //! - Clear log messages to help future debugging.
 
 use anyhow::Result;
+use std::env;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -17,6 +18,11 @@ use winit::{
 
 /// Public entry: runs a basic window loop (returns on close).
 pub fn run_basic_window() -> Result<()> {
+    log::info!(
+        "Env: DISPLAY={:?}, WAYLAND_DISPLAY={:?}",
+        env::var("DISPLAY").ok(),
+        env::var("WAYLAND_DISPLAY").ok()
+    );
     // New API: EventLoop::new() -> Result<...>
     let event_loop: EventLoop<()> = EventLoop::new().expect("Failed to create event loop");
 
