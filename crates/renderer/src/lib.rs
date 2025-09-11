@@ -11,40 +11,30 @@ use wgpu::{
 use winit::{dpi::PhysicalSize, window::Window};
 
 pub struct GpuState {
-    // Surface & its configuration
     surface: Surface<'static>,
     surface_format: TextureFormat,
     surface_config: SurfaceConfiguration,
 
-    // Core device & queue
     device: Device,
     queue: Queue,
 
-    // Cached size
     width: u32,
     height: u32,
-
-    // Keep window alive
-    _window: Arc<Window>,
 }
 
-unsafe impl Send for GpuState {}
-unsafe impl Sync for GpuState {}
-
 impl GpuState {
-    /// Create GPU state bound to a window surface.
-    pub async fn new(window: Window) -> Self {
-        let window = Arc::new(window);
+    /// Создаём Surface от Arc<Window> — корректно для wgpu 0.26 (без unsafe).
+    pub async fn new(window: Arc<Window>) -> Self {
         let PhysicalSize { width, height } = window.inner_size();
         let width = width.max(1);
         let height = height.max(1);
 
         // Instance & surface
         let instance = Instance::new(&InstanceDescriptor::default());
-        let surface = instance.create_surface(&window).expect("create_surface failed");
-        // SAFETY: We extend the lifetime to 'static because we store Arc<Window>
-        // This is safe because the Arc<Window> is stored in the struct
-        let surface = unsafe { std::mem::transmute::<Surface<'_>, Surface<'static>>(surface) };
+        // Передаём КЛОН Arc<Window> — паттерн для корректного лайфтайма Surface<'window>.
+        let surface: Surface<'static> = instance
+            .create_surface(window.clone())
+            .expect("create_surface failed");
 
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
@@ -55,13 +45,14 @@ impl GpuState {
             .await
             .expect("No suitable GPU adapter");
 
-        // Device & queue
+        // Device & queue (API 0.26)
         let (device, queue) = adapter
             .request_device(
                 &DeviceDescriptor {
                     label: Some("Svarog3D Device"),
                     required_features: Features::empty(),
-                    required_limits: Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits()),
+                    required_limits: Limits::downlevel_webgl2_defaults()
+                        .using_resolution(adapter.limits()),
                     memory_hints: Default::default(),
                     trace: Default::default(),
                 },
@@ -99,11 +90,9 @@ impl GpuState {
             queue,
             width,
             height,
-            _window: window,
         }
     }
 
-    /// Resize surface on window events.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(1);
         self.height = height.max(1);
@@ -112,7 +101,7 @@ impl GpuState {
         self.surface.configure(&self.device, &self.surface_config);
     }
 
-    /// Render one frame with clear color.
+    /// Clear color кадр.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
@@ -128,6 +117,7 @@ impl GpuState {
                 label: Some("ClearPass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None, // ВАЖНО для wgpu 0.26
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color {
@@ -138,14 +128,12 @@ impl GpuState {
                         }),
                         store: StoreOp::Store,
                     },
-                    depth_slice: None,
                 })],
                 depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
             });
-            // nothing to draw for B1
-            // rpass will be dropped automatically
+            // rpass drop
         }
 
         self.queue.submit(Some(encoder.finish()));
@@ -153,12 +141,10 @@ impl GpuState {
         Ok(())
     }
 
-    /// Whether the error requires surface re-create/reconfigure.
     pub fn is_surface_lost(err: &SurfaceError) -> bool {
         matches!(err, SurfaceError::Lost | SurfaceError::Outdated)
     }
 
-    /// Reconfigure the surface with the current size.
     pub fn recreate_surface(&mut self) {
         self.resize(self.width, self.height);
     }

@@ -1472,7 +1472,6 @@ name = "renderer"
 version = "0.1.0"
 dependencies = [
  "bytemuck",
- "parking_lot",
  "pollster",
  "wgpu",
  "winit",

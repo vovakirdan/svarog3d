@@ -9,4 +9,3 @@ bytemuck = { version = "1.23.2", features = ["derive"] }
 pollster = "0.4.0"
 wgpu = "26.0.1"
 winit = "0.30.12"
-parking_lot = "0.12.3"
