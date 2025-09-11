@@ -29,8 +29,8 @@ pub fn run_with_renderer() -> Result<()> {
 
 #[derive(Default)]
 struct App {
-    window: Option<Arc<Window>>,
     gpu: Option<renderer::GpuState>,
+    window: Option<Arc<Window>>,
 }
 
 impl ApplicationHandler for App {
@@ -64,12 +64,16 @@ impl ApplicationHandler for App {
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
+        _window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("Close requested. Exiting.");
+                // Сначала корректно освобождаем все GPU-ресурсы (Surface/Device/Queue).
+                let _ = self.gpu.take(); // drop happens here
+                // Затем окно (опционально, но порядок уже безопасный).
+                let _ = self.window.take();
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {

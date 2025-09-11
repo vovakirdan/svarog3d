@@ -12,6 +12,7 @@ use winit::{dpi::PhysicalSize, window::Window};
 
 pub struct GpuState {
     surface: Surface<'static>,
+    #[allow(dead_code)]
     surface_format: TextureFormat,
     surface_config: SurfaceConfiguration,
 
