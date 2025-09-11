@@ -1,0 +1,8 @@
+[package]
+name = "corelib"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror = "2.0.16"

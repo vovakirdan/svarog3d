@@ -1,6 +1,17 @@
-[package]
+[workspace]
+members = [
+    "crates/app", "crates/asset", "crates/core",
+    "crates/platform", "crates/renderer",
+]
+resolver = "2"
+
+[workspace.package]
 name = "svarog3d"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
-[dependencies]
+[workspace.dependencies]
+log = "0.4.28"
+anyhow = "1.0.99"
+env_logger = "0.11.8"
