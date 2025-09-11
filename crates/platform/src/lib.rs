@@ -30,7 +30,9 @@ pub fn run_basic_window() -> Result<()> {
     let mut app = App::default();
 
     // Run until exit()
-    event_loop.run_app(&mut app).map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
+    event_loop
+        .run_app(&mut app)
+        .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
     Ok(())
 }
 
@@ -60,13 +62,15 @@ impl ApplicationHandler for App {
         // Keep CPU low at idle: don't request redraws yet.
         event_loop.set_control_flow(ControlFlow::Wait);
 
+        window.request_redraw();
+
         self.window = Some(window);
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
@@ -87,6 +91,14 @@ impl ApplicationHandler for App {
                     scale_factor
                 );
                 // Future: surface reconfig. For now we only log.
+            }
+            WindowEvent::RedrawRequested => {
+                // Пока рендера нет — просто логируем факт запроса.
+                // На следующих шагах здесь будет GPU clear.
+                log::debug!("RedrawRequested for window {:?}", window_id);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             _ => {}
         }
