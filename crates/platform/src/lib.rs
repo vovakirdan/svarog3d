@@ -17,7 +17,7 @@ use winit::{
 };
 
 /// Public entry: runs a basic window loop (returns on close).
-pub fn run_basic_window() -> Result<()> {
+pub fn run_with_renderer() -> Result<()> {
     log::info!(
         "Env: DISPLAY={:?}, WAYLAND_DISPLAY={:?}",
         env::var("DISPLAY").ok(),
@@ -40,6 +40,7 @@ pub fn run_basic_window() -> Result<()> {
 #[derive(Default)]
 struct App {
     window: Option<Window>,
+    gpu: Option<renderer::GpuState>,
 }
 
 impl ApplicationHandler for App {
@@ -64,13 +65,16 @@ impl ApplicationHandler for App {
 
         window.request_redraw();
 
-        self.window = Some(window);
+        // Init GPU (block on async once) - window ownership moves to GpuState
+        let gpu = pollster::block_on(renderer::GpuState::new(window));
+
+        self.gpu = Some(gpu);
     }
 
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        window_id: WindowId,
+        _window_id: WindowId,
         event: WindowEvent,
     ) {
         match event {
@@ -93,9 +97,19 @@ impl ApplicationHandler for App {
                 // Future: surface reconfig. For now we only log.
             }
             WindowEvent::RedrawRequested => {
-                // Пока рендера нет — просто логируем факт запроса.
-                // На следующих шагах здесь будет GPU clear.
-                log::debug!("RedrawRequested for window {:?}", window_id);
+                // Render pass
+                if let Some(gpu) = self.gpu.as_mut() {
+                    match gpu.render() {
+                        Ok(()) => {}
+                        Err(e) => {
+                            log::warn!("Render error: {e:?}");
+                            if renderer::GpuState::is_surface_lost(&e) {
+                                log::warn!("Surface lost/outdated. Recreating…");
+                                gpu.recreate_surface();
+                            }
+                        }
+                    }
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
