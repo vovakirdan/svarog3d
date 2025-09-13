@@ -12,7 +12,12 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use corelib::{camera::Camera, transform::Transform, vec3};
+use corelib::{
+    camera::Camera,
+    ecs::{MeshKind, Renderable, World},
+    transform::Transform,
+    vec3,
+};
 
 /// Public entry: runs a window + renderer. Returns on close.
 pub fn run_with_renderer(
@@ -45,22 +50,26 @@ pub fn run_with_renderer(
 struct App {
     gpu: Option<renderer::GpuState>,
     window: Option<Arc<Window>>,
-    // Конфиг
+
+    // Config
     backends: wgpu::Backends,
     show_fps: bool,
     width: u32,
     height: u32,
 
+    // FPS counters
     frames: u32,
     last_fps_instant: Option<Instant>,
 
-    // animation state
+    // Animation
     last_time: Option<Instant>,
-    angle: f32,
 
-    // scene
+    // Scene via ECS
+    world: World,
     camera: Option<Camera>,
-    model: Transform,
+
+    // Reusable per-frame draw list to avoid allocs
+    draw_list: Vec<Transform>,
 }
 
 impl ApplicationHandler for App {
@@ -90,23 +99,37 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
         let camera = Camera::new_perspective(
-            vec3(0.0, 0.0, 4.0),
+            vec3(0.0, 3.0, 8.0),
             vec3(0.0, 0.0, 0.0),
             corelib::Vec3::Y,
             60f32.to_radians(),
             0.1,
-            100.0,
+            200.0,
             aspect,
         );
         self.camera = Some(camera);
-        self.model = Transform::from_trs(
-            vec3(0.0, 0.0, 0.0),
-            vec3(0.0, 0.0, 0.0),
-            vec3(1.0, 1.0, 1.0),
-        );
-
         gpu.set_camera(&camera);
-        gpu.set_model(&self.model);
+
+        // Build scene: grid of cubes (e.g., 10x10)
+        self.world = World::new();
+        let grid_x = 10u32;
+        let grid_y = 10u32;
+        let spacing = 2.5_f32;
+        let origin_offset_x = (grid_x as f32 - 1.0) * spacing * 0.5;
+        let origin_offset_y = (grid_y as f32 - 1.0) * spacing * 0.5;
+
+        for gy in 0..grid_y {
+            for gx in 0..grid_x {
+                let x = gx as f32 * spacing - origin_offset_x;
+                let z = gy as f32 * spacing - origin_offset_y;
+                let t =
+                    Transform::from_trs(vec3(x, 0.0, z), vec3(0.0, 0.0, 0.0), vec3(0.9, 0.9, 0.9));
+                let r = Renderable {
+                    mesh: MeshKind::Cube,
+                };
+                let _e = self.world.spawn(t, Some(r));
+            }
+        }
 
         // Control flow + first frame
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -117,7 +140,7 @@ impl ApplicationHandler for App {
         self.frames = 0;
         self.last_fps_instant = Some(Instant::now());
         self.last_time = Some(Instant::now());
-        self.angle = 0.0;
+        self.draw_list = Vec::with_capacity((grid_x * grid_y) as usize);
     }
 
     fn window_event(
@@ -161,23 +184,29 @@ impl ApplicationHandler for App {
                 log::info!("Scale factor changed: {:.3}", scale_factor);
             }
             WindowEvent::RedrawRequested => {
-                // animate model (rotate)
-                if let Some(t0) = self.last_time {
-                    let dt = t0.elapsed().as_secs_f32().max(1e-6);
+                // dt
+                let dt = if let Some(t0) = self.last_time {
+                    let d = t0.elapsed().as_secs_f32().max(1e-6);
                     self.last_time = Some(Instant::now());
-                    self.angle += dt;
-                    self.model = Transform::from_trs(
-                        vec3(0.0, 0.0, 0.0),
-                        vec3(0.5 * self.angle, self.angle, 0.0),
-                        vec3(1.0, 1.0, 1.0),
-                    );
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.set_model(&self.model);
-                    }
+                    d
+                } else {
+                    self.last_time = Some(Instant::now());
+                    0.0
+                };
+
+                // Animate: rotate all transforms a bit
+                self.world.system_rotate_all(dt, [0.3, 0.6, 0.0]);
+
+                // Build draw list WITHOUT allocation (reuse vector)
+                self.draw_list.clear();
+                for (t, _r) in self.world.iter_renderables() {
+                    // В будущем будем ветвиться по mesh/material; пока все кубы.
+                    self.draw_list.push(*t);
                 }
 
+                // Render
                 if let Some(gpu) = self.gpu.as_mut() {
-                    if let Err(e) = gpu.render() {
+                    if let Err(e) = gpu.render_models(&self.draw_list) {
                         log::warn!("Render error: {e:?}");
                         if renderer::GpuState::is_surface_lost(&e) {
                             log::warn!("Surface lost/outdated. Recreating…");

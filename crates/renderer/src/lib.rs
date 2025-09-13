@@ -10,13 +10,13 @@ use corelib::{Mat4, Vec3, camera::Camera, transform::Transform};
 use wgpu::{
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device,
-    Extent3d, FragmentState, Instance, InstanceDescriptor, LoadOp, Operations,
-    PipelineLayoutDescriptor, PowerPreference, PresentMode, Queue, RenderPassColorAttachment,
-    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
-    ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError,
-    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
-    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode, util::DeviceExt,
+    CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device, Extent3d, FragmentState,
+    Instance, InstanceDescriptor, LoadOp, Operations, PipelineLayoutDescriptor, PowerPreference,
+    PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
+    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Surface,
+    SurfaceConfiguration, SurfaceError, TextureDescriptor, TextureDimension, TextureFormat,
+    TextureUsages, TextureView, TextureViewDescriptor, VertexBufferLayout, VertexState,
+    VertexStepMode, util::DeviceExt,
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -33,6 +33,40 @@ impl Vertex {
         step_mode: VertexStepMode::Vertex,
         attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
     };
+}
+
+/// Per-instance model matrix as 4 **columns** (WGSL mat4x4 expects columns).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct InstanceRaw {
+    pub col0: [f32; 4],
+    pub col1: [f32; 4],
+    pub col2: [f32; 4],
+    pub col3: [f32; 4],
+}
+
+impl InstanceRaw {
+    pub const LAYOUT: VertexBufferLayout<'static> = VertexBufferLayout {
+        array_stride: std::mem::size_of::<InstanceRaw>() as u64,
+        step_mode: VertexStepMode::Instance,
+        attributes: &wgpu::vertex_attr_array![
+            2 => Float32x4, // col0
+            3 => Float32x4, // col1
+            4 => Float32x4, // col2
+            5 => Float32x4, // col3
+        ],
+    };
+
+    pub fn from_model(m: Mat4) -> Self {
+        // glam::Mat4 хранится в column-major; берём колонки напрямую.
+        let c = m.to_cols_array();
+        Self {
+            col0: [c[0],  c[1],  c[2],  c[3]],
+            col1: [c[4],  c[5],  c[6],  c[7]],
+            col2: [c[8],  c[9],  c[10], c[11]],
+            col3: [c[12], c[13], c[14], c[15]],
+        }
+    }
 }
 
 /// Camera UBO (16-byte aligned).
@@ -68,6 +102,9 @@ pub struct GpuState {
     vertex_buf: Buffer,
     index_buf: Buffer,
     index_count: u32,
+    instance_buf: Buffer,
+    instance_capacity: u32,
+    instance_count: u32,
 
     // Camera / model state (from core)
     camera: Camera,
@@ -243,6 +280,13 @@ impl GpuState {
                 resource: camera_buf.as_entire_binding(),
             }],
         });
+        let instance_capacity = 0;
+        let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Instance Buffer"),
+            size: 64, // минимальный заглушечный размер (64 байта), всё равно перезальём позже
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
@@ -256,7 +300,7 @@ impl GpuState {
             vertex: VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
-                buffers: &[Vertex::LAYOUT],
+                buffers: &[Vertex::LAYOUT, InstanceRaw::LAYOUT],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },
             fragment: Some(FragmentState {
@@ -330,6 +374,9 @@ impl GpuState {
             model,
             width,
             height,
+            instance_buf,
+            instance_capacity,
+            instance_count: 0,
         }
     }
 
@@ -424,6 +471,104 @@ impl GpuState {
 
     pub fn recreate_surface(&mut self) {
         self.resize(self.width, self.height);
+    }
+
+    /// Render a list of models (one draw call).
+    pub fn render_models(
+        &mut self,
+        models: &[corelib::transform::Transform],
+    ) -> Result<(), SurfaceError> {
+        // 1) Подготовим массив инстансов (модельные матрицы)
+        //    ОДНА аллокация на кадр у вызывающей стороны уже есть (draw_list),
+        //    здесь — превращаем в InstanceRaw (можно использовать стаck-alloc via smallvec, но пока простое Vec).
+        let mut instances: Vec<InstanceRaw> = Vec::with_capacity(models.len());
+        let pv = self.camera.proj_view();
+        for m in models {
+            let model = m.matrix();
+            // Вершинный шейдер умножает: MVP * model * pos; здесь подаём только model как инстанс-атрибут.
+            instances.push(InstanceRaw::from_model(model));
+        }
+
+        // 2) Обновляем/расширяем буфер, если нужно (grow only, без лишних recreate)
+        let needed = (instances.len().max(1) as u64) * std::mem::size_of::<InstanceRaw>() as u64;
+        if needed > self.instance_buf.size() {
+            // Реаллоцируем с запасом (next power of two)
+            let new_cap = needed.next_power_of_two();
+            self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Instance Buffer (grown)"),
+                size: new_cap,
+                usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            self.instance_capacity = (new_cap / std::mem::size_of::<InstanceRaw>() as u64) as u32;
+        }
+
+        // 3) Один upload на кадр
+        if !instances.is_empty() {
+            self.queue
+                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&instances));
+        }
+        self.instance_count = instances.len() as u32;
+
+        // 4) Рендер одним проходом и ОДНИМ draw_indexed с instance_count
+        let frame = self.surface.get_current_texture()?;
+        let view = frame.texture.create_view(&Default::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("MainEncoder"),
+            });
+
+        let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("MainPass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &view,
+                depth_slice: None,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(wgpu::Color {
+                        r: 0.05,
+                        g: 0.05,
+                        b: 0.08,
+                        a: 1.0,
+                    }),
+                    store: StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            occlusion_query_set: None,
+            timestamp_writes: None,
+        });
+
+        rpass.set_pipeline(&self.pipeline);
+        rpass.set_bind_group(0, &self.camera_bg, &[]);
+        rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
+        rpass.set_vertex_buffer(1, self.instance_buf.slice(..)); // <--- инстансы
+        rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
+
+        // ВНИМАНИЕ: теперь шейдер умножает model из инстанса, поэтому здесь UBO `mvp` — это только PV!
+        let mvp = OPENGL_TO_WGPU * pv; // без model
+        self.queue.write_buffer(
+            &self.camera_buf,
+            0,
+            bytemuck::bytes_of(&CameraUniform {
+                mvp: mvp.to_cols_array_2d(),
+            }),
+        );
+
+        rpass.draw_indexed(0..self.index_count, 0, 0..self.instance_count);
+        drop(rpass);
+
+        self.queue.submit(Some(encoder.finish()));
+        frame.present();
+        Ok(())
     }
 }
 

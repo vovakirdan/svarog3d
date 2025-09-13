@@ -3,6 +3,7 @@
 pub use glam::{EulerRot, Mat4, Quat, Vec3, vec3};
 
 pub mod camera;
+pub mod ecs;
 pub mod transform;
 
 #[cfg(test)]
