@@ -2,7 +2,7 @@
 //! Step B1 integration: create WGPU surface and clear screen.
 
 use anyhow::Result;
-use std::{env, sync::Arc};
+use std::{env, sync::Arc, time::Instant};
 use wgpu;
 use winit::{
     application::ApplicationHandler,
@@ -13,7 +13,7 @@ use winit::{
 };
 
 /// Public entry: runs a window + renderer. Returns on close.
-pub fn run_with_renderer(backends: wgpu::Backends) -> Result<()> {
+pub fn run_with_renderer(backends: wgpu::Backends, show_fps: bool, width: u32, height: u32) -> Result<()> {
     log::info!(
         "Env: DISPLAY={:?}, WAYLAND_DISPLAY={:?}",
         env::var("DISPLAY").ok(),
@@ -23,6 +23,9 @@ pub fn run_with_renderer(backends: wgpu::Backends) -> Result<()> {
     let event_loop: EventLoop<()> = EventLoop::new().expect("Failed to create event loop");
     let mut app = App {
         backends,
+        show_fps,
+        width,
+        height,
         ..Default::default()
     };
     event_loop
@@ -37,14 +40,20 @@ struct App {
     window: Option<Arc<Window>>,
     // Конфиг
     backends: wgpu::Backends,
+    show_fps: bool,
+    width: u32,
+    height: u32,
+
+    frames: u32,
+    last_fps_instant: Option<Instant>,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create window
         let attrs = Window::default_attributes()
-            .with_title("Svarog3D")
-            .with_inner_size(LogicalSize::new(1280.0_f64, 720.0_f64));
+            .with_title(format!("Svarog3D (running with wgpu backend {:?})", self.backends))
+            .with_inner_size(LogicalSize::new(self.width as f64, self.height as f64));
         let w = event_loop
             .create_window(attrs)
             .expect("Failed to create window");
@@ -65,6 +74,9 @@ impl ApplicationHandler for App {
 
         self.gpu = Some(gpu);
         self.window = Some(window);
+        
+        self.frames = 0;
+        self.last_fps_instant = Some(Instant::now());
     }
 
     fn window_event(
@@ -107,6 +119,22 @@ impl ApplicationHandler for App {
                                 log::warn!("Surface lost/outdated. Recreating…");
                                 gpu.recreate_surface();
                             }
+                        }
+                    }
+                }
+                // FPS: счёт и обновление заголовка раз в ~1 сек
+                if self.show_fps {
+                    self.frames += 1;
+                    if let Some(t0) = self.last_fps_instant {
+                        let dt = t0.elapsed();
+                        if dt.as_secs_f32() >= 1.0 {
+                            let fps = self.frames as f32 / dt.as_secs_f32();
+                            if let Some(w) = &self.window {
+                                w.set_title(&format!("Svarog3D (running with wgpu backend {:?}) {:.1} FPS", self.backends, fps));
+                            }
+                            // log::info!("FPS: {:.1}", fps);
+                            self.frames = 0;
+                            self.last_fps_instant = Some(Instant::now());
                         }
                     }
                 }

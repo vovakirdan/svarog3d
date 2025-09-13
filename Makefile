@@ -4,6 +4,19 @@
 # 3. Создать команду run-wsl для запуска app с отключённым WAYLAND_DISPLAY (для WSL/CI).
 
 .PHONY: build, run, run-wayland-off
+.PHONY: run-gpu-vulkan, run-gpu-gl, run-gpu-dx12, run-gpu-metal
+
+help:
+	@echo "Usage: make <target>"
+	@echo "Targets:"
+	@echo "  build - Build all workspace crates"
+	@echo "  run - Run app crate"
+	@echo "  run-wayland-off - Run app crate with WAYLAND_DISPLAY unset (WSL/CI)"
+	@echo "  run-gpu-vulkan - Run app crate with GPU backend VK"
+	@echo "  run-gpu-gl - Run app crate with GPU backend GL"
+	@echo "  run-gpu-dx12 - Run app crate with GPU backend DX12"
+	@echo "  run-gpu-metal - Run app crate with GPU backend Metal"
+
 build:
 	@echo "Building all workspace crates..."
 	cargo build --workspace
