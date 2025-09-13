@@ -105,7 +105,9 @@ impl ApplicationHandler for App {
                     }
                 }
                 // Для анимации можно зациклить:
-                if let Some(w) = &self.window { w.request_redraw(); }
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
             }
             _ => {}
         }

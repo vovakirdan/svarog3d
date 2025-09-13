@@ -8,17 +8,15 @@ use std::time::Instant;
 use bytemuck::{Pod, Zeroable};
 use glam::{Mat4, Vec3};
 use wgpu::{
-    util::DeviceExt,
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device, DeviceDescriptor,
-    Extent3d, Features, FragmentState,
-    Instance, InstanceDescriptor, Limits, LoadOp, Operations, PipelineLayoutDescriptor,
-    PowerPreference, PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor,
-    RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages,
-    StoreOp, Surface, SurfaceConfiguration, SurfaceError, TextureDescriptor, TextureDimension,
-    TextureFormat, TextureUsages, TextureView, TextureViewDescriptor, VertexBufferLayout,
-    VertexState, VertexStepMode,
+    Extent3d, Features, FragmentState, Instance, InstanceDescriptor, Limits, LoadOp, Operations,
+    PipelineLayoutDescriptor, PowerPreference, PresentMode, Queue, RenderPassColorAttachment,
+    RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
+    ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError,
+    TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
+    TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode, util::DeviceExt,
 };
 
 use winit::{dpi::PhysicalSize, window::Window};
@@ -79,6 +77,11 @@ pub struct GpuState {
     height: u32,
 }
 
+/// Converts OpenGL clip space (z in [-1,1]) to WGPU/D3D clip (z in [0,1]).
+const OPENGL_TO_WGPU: glam::Mat4 = glam::Mat4::from_cols_array(&[
+    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+]);
+
 impl GpuState {
     /// Create GPU state bound to an Arc<Window>.
     pub async fn new(window: Arc<Window>) -> Self {
@@ -102,16 +105,14 @@ impl GpuState {
             .expect("No suitable GPU adapter");
 
         let (device, queue) = adapter
-            .request_device(
-                &DeviceDescriptor {
-                    label: Some("Svarog3D Device"),
-                    required_features: Features::empty(),
-                    required_limits: Limits::downlevel_webgl2_defaults()
-                        .using_resolution(adapter.limits()),
-                    memory_hints: Default::default(),
-                    trace: Default::default(),
-                },
-            )
+            .request_device(&DeviceDescriptor {
+                label: Some("Svarog3D Device"),
+                required_features: Features::empty(),
+                required_limits: Limits::downlevel_webgl2_defaults()
+                    .using_resolution(adapter.limits()),
+                memory_hints: Default::default(),
+                trace: Default::default(),
+            })
             .await
             .expect("request_device failed");
 
@@ -208,7 +209,7 @@ impl GpuState {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None, // Some(wgpu::Face::Back),
                 ..Default::default()
             },
             depth_stencil: Some(DepthStencilState {
@@ -272,13 +273,13 @@ impl GpuState {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.width as f32 / self.height as f32;
         let proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
-        let view = Mat4::look_at_rh(
-            Vec3::new(0.0, 0.0, 4.0),
-            Vec3::ZERO,
-            Vec3::Y,
-        );
+        // right-handed view (camera at +Z looking to origin)
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, Vec3::Y);
         let model = Mat4::from_rotation_y(t) * Mat4::from_rotation_x(0.5 * t);
-        let mvp = proj * view * model;
+
+        // Convert GL clip space -> WGPU clip space to match depth [0,1]
+        let mvp = OPENGL_TO_WGPU * proj * view * model;
+
         let cam = CameraUniform {
             mvp: mvp.to_cols_array_2d(),
         };
@@ -368,29 +369,48 @@ fn create_depth_view(device: &Device, sc: &SurfaceConfiguration) -> TextureView 
 fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
     let v = [
         // back z=-1
-        Vertex { pos: [-1.0, -1.0, -1.0], color: [1.0, 0.0, 0.0] }, // 0
-        Vertex { pos: [ 1.0, -1.0, -1.0], color: [0.0, 1.0, 0.0] }, // 1
-        Vertex { pos: [ 1.0,  1.0, -1.0], color: [0.0, 0.0, 1.0] }, // 2
-        Vertex { pos: [-1.0,  1.0, -1.0], color: [1.0, 1.0, 0.0] }, // 3
+        Vertex {
+            pos: [-1.0, -1.0, -1.0],
+            color: [1.0, 0.0, 0.0],
+        }, // 0
+        Vertex {
+            pos: [1.0, -1.0, -1.0],
+            color: [0.0, 1.0, 0.0],
+        }, // 1
+        Vertex {
+            pos: [1.0, 1.0, -1.0],
+            color: [0.0, 0.0, 1.0],
+        }, // 2
+        Vertex {
+            pos: [-1.0, 1.0, -1.0],
+            color: [1.0, 1.0, 0.0],
+        }, // 3
         // front z=+1
-        Vertex { pos: [-1.0, -1.0,  1.0], color: [1.0, 0.0, 1.0] }, // 4
-        Vertex { pos: [ 1.0, -1.0,  1.0], color: [0.0, 1.0, 1.0] }, // 5
-        Vertex { pos: [ 1.0,  1.0,  1.0], color: [1.0, 1.0, 1.0] }, // 6
-        Vertex { pos: [-1.0,  1.0,  1.0], color: [1.0, 0.5, 0.0] }, // 7
+        Vertex {
+            pos: [-1.0, -1.0, 1.0],
+            color: [1.0, 0.0, 1.0],
+        }, // 4
+        Vertex {
+            pos: [1.0, -1.0, 1.0],
+            color: [0.0, 1.0, 1.0],
+        }, // 5
+        Vertex {
+            pos: [1.0, 1.0, 1.0],
+            color: [1.0, 1.0, 1.0],
+        }, // 6
+        Vertex {
+            pos: [-1.0, 1.0, 1.0],
+            color: [1.0, 0.5, 0.0],
+        }, // 7
     ];
     let idx: [u16; 36] = [
-        // front (+Z): 4,5,6, 4,6,7
-        4, 5, 6, 4, 6, 7,
-        // back (-Z): 0,2,1, 0,3,2
-        0, 2, 1, 0, 3, 2,
-        // top (+Y): 3,2,6, 3,6,7
-        3, 2, 6, 3, 6, 7,
-        // bottom (-Y): 0,5,1, 0,4,5
-        0, 5, 1, 0, 4, 5,
-        // left (-X): 0,3,7, 0,7,4
-        0, 3, 7, 0, 7, 4,
-        // right (+X): 1,2,6, 1,6,5
-        1, 2, 6, 1, 6, 5,
+        // front (+Z): counter-clockwise when viewed from outside
+        4, 6, 5, 4, 7, 6, // back (-Z): counter-clockwise when viewed from outside
+        0, 1, 2, 0, 2, 3, // top (+Y): counter-clockwise when viewed from outside
+        3, 6, 2, 3, 7, 6, // bottom (-Y): counter-clockwise when viewed from outside
+        0, 4, 5, 0, 5, 1, // left (-X): counter-clockwise when viewed from outside
+        0, 7, 3, 0, 4, 7, // right (+X): counter-clockwise when viewed from outside
+        1, 5, 6, 1, 6, 2,
     ];
     (v.to_vec(), idx.to_vec())
 }
