@@ -12,8 +12,15 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use corelib::{camera::Camera, transform::Transform, vec3};
+
 /// Public entry: runs a window + renderer. Returns on close.
-pub fn run_with_renderer(backends: wgpu::Backends, show_fps: bool, width: u32, height: u32) -> Result<()> {
+pub fn run_with_renderer(
+    backends: wgpu::Backends,
+    show_fps: bool,
+    width: u32,
+    height: u32,
+) -> Result<()> {
     log::info!(
         "Env: DISPLAY={:?}, WAYLAND_DISPLAY={:?}",
         env::var("DISPLAY").ok(),
@@ -46,13 +53,24 @@ struct App {
 
     frames: u32,
     last_fps_instant: Option<Instant>,
+
+    // animation state
+    last_time: Option<Instant>,
+    angle: f32,
+
+    // scene
+    camera: Option<Camera>,
+    model: Transform,
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         // Create window
         let attrs = Window::default_attributes()
-            .with_title(format!("Svarog3D (running with wgpu backend {:?})", self.backends))
+            .with_title(format!(
+                "Svarog3D (running with wgpu backend {:?})",
+                self.backends
+            ))
             .with_inner_size(LogicalSize::new(self.width as f64, self.height as f64));
         let w = event_loop
             .create_window(attrs)
@@ -66,17 +84,40 @@ impl ApplicationHandler for App {
         );
 
         // Init GPU (pass Arc<Window>)
-        let gpu = pollster::block_on(renderer::GpuState::new(window.clone(), self.backends));
+        let mut gpu = pollster::block_on(renderer::GpuState::new(window.clone(), self.backends));
 
-        // Low CPU at idle + первый кадр
+        // Setup camera & model
+        let size = window.inner_size();
+        let aspect = size.width.max(1) as f32 / size.height.max(1) as f32;
+        let camera = Camera::new_perspective(
+            vec3(0.0, 0.0, 4.0),
+            vec3(0.0, 0.0, 0.0),
+            corelib::Vec3::Y,
+            60f32.to_radians(),
+            0.1,
+            100.0,
+            aspect,
+        );
+        self.camera = Some(camera);
+        self.model = Transform::from_trs(
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.0, 1.0, 1.0),
+        );
+
+        gpu.set_camera(&camera);
+        gpu.set_model(&self.model);
+
+        // Control flow + first frame
         event_loop.set_control_flow(ControlFlow::Wait);
         window.request_redraw();
 
         self.gpu = Some(gpu);
         self.window = Some(window);
-        
         self.frames = 0;
         self.last_fps_instant = Some(Instant::now());
+        self.last_time = Some(Instant::now());
+        self.angle = 0.0;
     }
 
     fn window_event(
@@ -99,6 +140,16 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(new_size.width, new_size.height);
                 }
+
+                // update camera aspect
+                if let Some(cam) = self.camera {
+                    let aspect = (new_size.width.max(1) as f32) / (new_size.height.max(1) as f32);
+                    let cam2 = Camera { aspect, ..cam };
+                    self.camera = Some(cam2);
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.set_camera(&cam2);
+                    }
+                }
                 if let Some(w) = &self.window {
                     w.request_redraw();
                 }
@@ -110,15 +161,27 @@ impl ApplicationHandler for App {
                 log::info!("Scale factor changed: {:.3}", scale_factor);
             }
             WindowEvent::RedrawRequested => {
+                // animate model (rotate)
+                if let Some(t0) = self.last_time {
+                    let dt = t0.elapsed().as_secs_f32().max(1e-6);
+                    self.last_time = Some(Instant::now());
+                    self.angle += dt;
+                    self.model = Transform::from_trs(
+                        vec3(0.0, 0.0, 0.0),
+                        vec3(0.5 * self.angle, self.angle, 0.0),
+                        vec3(1.0, 1.0, 1.0),
+                    );
+                    if let Some(gpu) = self.gpu.as_mut() {
+                        gpu.set_model(&self.model);
+                    }
+                }
+
                 if let Some(gpu) = self.gpu.as_mut() {
-                    match gpu.render() {
-                        Ok(()) => {}
-                        Err(e) => {
-                            log::warn!("Render error: {e:?}");
-                            if renderer::GpuState::is_surface_lost(&e) {
-                                log::warn!("Surface lost/outdated. Recreating…");
-                                gpu.recreate_surface();
-                            }
+                    if let Err(e) = gpu.render() {
+                        log::warn!("Render error: {e:?}");
+                        if renderer::GpuState::is_surface_lost(&e) {
+                            log::warn!("Surface lost/outdated. Recreating…");
+                            gpu.recreate_surface();
                         }
                     }
                 }
@@ -130,7 +193,10 @@ impl ApplicationHandler for App {
                         if dt.as_secs_f32() >= 1.0 {
                             let fps = self.frames as f32 / dt.as_secs_f32();
                             if let Some(w) = &self.window {
-                                w.set_title(&format!("Svarog3D (running with wgpu backend {:?}) {:.1} FPS", self.backends, fps));
+                                w.set_title(&format!(
+                                    "Svarog3D (running with wgpu backend {:?}) {:.1} FPS",
+                                    self.backends, fps
+                                ));
                             }
                             // log::info!("FPS: {:.1}", fps);
                             self.frames = 0;

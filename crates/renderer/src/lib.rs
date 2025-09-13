@@ -1,17 +1,17 @@
-//! Renderer: wgpu init + depth + rotating cube (B3).
-//! A2: selectable backends with graceful fallback.
+//! Renderer: wgpu init + depth + cube.
+//! D1: camera/transform from `core` with setters.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
 use bytemuck::{Pod, Zeroable};
-use glam::{Mat4, Vec3};
+use corelib::{Mat4, Vec3, camera::Camera, transform::Transform};
 use wgpu::{
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState, ColorWrites,
-    CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device, DeviceDescriptor,
-    Extent3d, Features, FragmentState, Instance, InstanceDescriptor, Limits, LoadOp, Operations,
+    CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device,
+    Extent3d, FragmentState, Instance, InstanceDescriptor, LoadOp, Operations,
     PipelineLayoutDescriptor, PowerPreference, PresentMode, Queue, RenderPassColorAttachment,
     RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor, ShaderModuleDescriptor,
     ShaderSource, ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError,
@@ -42,7 +42,15 @@ struct CameraUniform {
     mvp: [[f32; 4]; 4],
 }
 
-const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus; // более совместим в WSL/GLES
+const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus;
+
+/// Converts OpenGL clip space (z in [-1,1]) to WGPU/D3D clip (z in [0,1]).
+const OPENGL_TO_WGPU: Mat4 = Mat4::from_cols_array(&[
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 0.5, 0.0, //
+    0.0, 0.0, 0.5, 1.0,
+]);
 
 pub struct GpuState {
     // Surface
@@ -61,28 +69,27 @@ pub struct GpuState {
     index_buf: Buffer,
     index_count: u32,
 
-    // Camera
+    // Camera / model state (from core)
+    camera: Camera,
+    model: Transform,
+
+    // Bindings
     #[allow(dead_code)]
     camera_bgl: BindGroupLayout,
     camera_bg: BindGroup,
     camera_buf: Buffer,
-    start: Instant,
 
     // Depth
     depth_view: TextureView,
+
+    // Time (only for FPS in platform; left here in case we need timers)
+    #[allow(dead_code)]
+    start: Instant,
 
     // Size cache
     width: u32,
     height: u32,
 }
-
-/// Converts OpenGL clip space (z in [-1,1]) to WGPU/D3D clip (z in [0,1]).
-const OPENGL_TO_WGPU: glam::Mat4 = glam::Mat4::from_cols_array(&[
-    1.0, 0.0, 0.0, 0.0, //
-    0.0, 1.0, 0.0, 0.0, //
-    0.0, 0.0, 0.5, 0.0, //
-    0.0, 0.0, 0.5, 1.0,
-]);
 
 impl GpuState {
     /// Create GPU state bound to an Arc<Window>. Backends are selectable (A2).
@@ -96,9 +103,10 @@ impl GpuState {
             backends,
             ..Default::default()
         });
-        let mut surface: Option<Surface<'static>> = instance.create_surface(window.clone()).ok();
+        let mut surface_opt: Option<Surface<'static>> =
+            instance.create_surface(window.clone()).ok();
 
-        let adapter = match surface.as_ref() {
+        let adapter = match surface_opt.as_ref() {
             Some(surf_ref) => {
                 match instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
@@ -114,13 +122,14 @@ impl GpuState {
                             "No adapter for requested backends {:?}. Falling back to Backends::all()",
                             backends
                         );
-                        // fallback instance + surface
                         instance = Instance::new(&InstanceDescriptor {
                             backends: wgpu::Backends::all(),
                             ..Default::default()
                         });
-                        surface = instance.create_surface(window.clone()).ok();
-                        let surf_ref = surface.as_ref().expect("create_surface failed (fallback)");
+                        surface_opt = instance.create_surface(window.clone()).ok();
+                        let surf_ref = surface_opt
+                            .as_ref()
+                            .expect("create_surface failed (fallback)");
                         instance
                             .request_adapter(&wgpu::RequestAdapterOptions {
                                 power_preference: PowerPreference::HighPerformance,
@@ -141,8 +150,10 @@ impl GpuState {
                     backends: wgpu::Backends::all(),
                     ..Default::default()
                 });
-                surface = instance.create_surface(window.clone()).ok();
-                let surf_ref = surface.as_ref().expect("create_surface failed (fallback)");
+                surface_opt = instance.create_surface(window.clone()).ok();
+                let surf_ref = surface_opt
+                    .as_ref()
+                    .expect("create_surface failed (fallback)");
                 instance
                     .request_adapter(&wgpu::RequestAdapterOptions {
                         power_preference: PowerPreference::HighPerformance,
@@ -154,12 +165,13 @@ impl GpuState {
             }
         };
 
-        let surf = surface.expect("surface is None");
+        let surface = surface_opt.expect("surface is None");
+
         let (device, queue) = adapter
-            .request_device(&DeviceDescriptor {
+            .request_device(&wgpu::DeviceDescriptor {
                 label: Some("Svarog3D Device"),
-                required_features: Features::empty(),
-                required_limits: Limits::downlevel_webgl2_defaults()
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(adapter.limits()),
                 memory_hints: Default::default(),
                 trace: Default::default(),
@@ -167,8 +179,8 @@ impl GpuState {
             .await
             .expect("request_device failed");
 
-        // Surface format (prefer sRGB)
-        let caps = surf.get_capabilities(&adapter);
+        // Surface format
+        let caps = surface.get_capabilities(&adapter);
         let surface_format = caps
             .formats
             .iter()
@@ -177,7 +189,7 @@ impl GpuState {
             .unwrap_or(caps.formats[0]);
 
         // Configure surface
-        let surface_config = SurfaceConfiguration {
+        let surface_config = wgpu::SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
             width,
@@ -187,19 +199,19 @@ impl GpuState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surf.configure(&device, &surface_config);
+        surface.configure(&device, &surface_config);
 
         // Depth texture
         let depth_view = create_depth_view(&device, &surface_config);
 
-        // ==== Shaders ====
+        // Shaders
         let shader_src: &str = include_str!("shaders/triangle.wgsl");
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Basic WGSL"),
             source: ShaderSource::Wgsl(shader_src.into()),
         });
 
-        // ==== Camera BGL/BG ====
+        // Camera BGL/BG
         let camera_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("Camera BGL"),
             entries: &[BindGroupLayoutEntry {
@@ -215,12 +227,12 @@ impl GpuState {
                 count: None,
             }],
         });
-        let camera_init = CameraUniform {
-            mvp: Mat4::IDENTITY.to_cols_array_2d(),
-        };
+
         let camera_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera UBO"),
-            contents: bytemuck::bytes_of(&camera_init),
+            contents: bytemuck::bytes_of(&CameraUniform {
+                mvp: Mat4::IDENTITY.to_cols_array_2d(),
+            }),
             usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         });
         let camera_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -232,7 +244,7 @@ impl GpuState {
             }],
         });
 
-        // ==== Pipeline ====
+        // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Basic PipelineLayout"),
             bind_group_layouts: &[&camera_bgl],
@@ -257,7 +269,7 @@ impl GpuState {
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
-            // Вариант A (твой): culling off — устраняет «пропадание» на WSL/GLES
+            // На WSL/GLES — без culling для стабильности
             primitive: wgpu::PrimitiveState {
                 cull_mode: None,
                 ..Default::default()
@@ -274,7 +286,7 @@ impl GpuState {
             cache: None,
         });
 
-        // ==== Geometry: indexed cube ====
+        // Geometry: indexed cube
         let (vertices, indices) = cube_vertices();
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Cube VB"),
@@ -287,8 +299,20 @@ impl GpuState {
             usage: BufferUsages::INDEX,
         });
 
+        // Default camera/model (будут заданы снаружи)
+        let camera = Camera::new_perspective(
+            Vec3::new(0.0, 0.0, 4.0),
+            Vec3::new(0.0, 0.0, 0.0),
+            Vec3::Y,
+            60f32.to_radians(),
+            0.1,
+            100.0,
+            width as f32 / height as f32,
+        );
+        let model = Transform::default();
+
         Self {
-            surface: surf,
+            surface,
             surface_format,
             surface_config,
             device,
@@ -300,11 +324,23 @@ impl GpuState {
             camera_bgl,
             camera_bg,
             camera_buf,
-            start: Instant::now(),
             depth_view,
+            start: Instant::now(),
+            camera,
+            model,
             width,
             height,
         }
+    }
+
+    /// External API: set camera from core (copied into internal state).
+    pub fn set_camera(&mut self, camera: &Camera) {
+        self.camera = *camera;
+    }
+
+    /// External API: set current model transform.
+    pub fn set_model(&mut self, model: &Transform) {
+        self.model = *model;
     }
 
     /// Resize: reconfigure surface & recreate depth view.
@@ -317,23 +353,21 @@ impl GpuState {
         self.depth_view = create_depth_view(&self.device, &self.surface_config);
     }
 
-    /// Render one frame: update MVP + clear + draw cube.
+    /// Render one frame: compute MVP from core::Camera/Transform, write UBO, draw cube.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
-        // --- update MVP
-        let t = self.start.elapsed().as_secs_f32();
-        let aspect = self.width as f32 / self.height as f32;
-        let proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
-        let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, Vec3::Y);
-        let model = Mat4::from_rotation_y(t) * Mat4::from_rotation_x(0.5 * t);
-        let mvp = OPENGL_TO_WGPU * proj * view * model;
+        // Compute MVP (GL-style PV → convert to WGPU NDC)
+        let pv = self.camera.proj_view();
+        let m = self.model.matrix();
+        let mvp = OPENGL_TO_WGPU * pv * m;
+        self.queue.write_buffer(
+            &self.camera_buf,
+            0,
+            bytemuck::bytes_of(&CameraUniform {
+                mvp: mvp.to_cols_array_2d(),
+            }),
+        );
 
-        let cam = CameraUniform {
-            mvp: mvp.to_cols_array_2d(),
-        };
-        self.queue
-            .write_buffer(&self.camera_buf, 0, bytemuck::bytes_of(&cam));
-
-        // --- frame & pass
+        // Acquire frame & encode pass
         let frame = self.surface.get_current_texture()?;
         let view = frame.texture.create_view(&Default::default());
 
@@ -348,7 +382,7 @@ impl GpuState {
                 label: Some("MainPass"),
                 color_attachments: &[Some(RenderPassColorAttachment {
                     view: &view,
-                    depth_slice: None, // required in 0.26
+                    depth_slice: None,
                     resolve_target: None,
                     ops: Operations {
                         load: LoadOp::Clear(wgpu::Color {
@@ -393,7 +427,6 @@ impl GpuState {
     }
 }
 
-/// Create a depth texture view matching the surface config.
 fn create_depth_view(device: &Device, sc: &SurfaceConfiguration) -> TextureView {
     let tex = device.create_texture(&TextureDescriptor {
         label: Some("DepthTex"),
@@ -412,7 +445,6 @@ fn create_depth_view(device: &Device, sc: &SurfaceConfiguration) -> TextureView 
     tex.create_view(&TextureViewDescriptor::default())
 }
 
-/// Unit cube (positions + colors) and indices (CCW).
 fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
     let v = [
         // back z=-1
@@ -451,13 +483,12 @@ fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
         }, // 7
     ];
     let idx: [u16; 36] = [
-        // +Z
-        4, 5, 6, 4, 6, 7, // -Z
-        0, 2, 1, 0, 3, 2, // +Y
-        3, 6, 2, 3, 7, 6, // -Y
-        0, 1, 5, 0, 5, 4, // -X
-        0, 3, 7, 0, 7, 4, // +X
-        1, 2, 6, 1, 6, 5,
+        4, 5, 6, 4, 6, 7, // +Z
+        0, 2, 1, 0, 3, 2, // -Z
+        3, 6, 2, 3, 7, 6, // +Y
+        0, 1, 5, 0, 5, 4, // -Y
+        0, 3, 7, 0, 7, 4, // -X
+        1, 2, 6, 1, 6, 5, // +X
     ];
     (v.to_vec(), idx.to_vec())
 }
