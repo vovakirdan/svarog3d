@@ -1,5 +1,5 @@
 //! Renderer: wgpu init + depth + rotating cube (B3).
-//! wgpu = 0.26.x, winit = 0.30.x
+//! A2: selectable backends with graceful fallback.
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
@@ -18,7 +18,6 @@ use wgpu::{
     TextureDescriptor, TextureDimension, TextureFormat, TextureUsages, TextureView,
     TextureViewDescriptor, VertexBufferLayout, VertexState, VertexStepMode, util::DeviceExt,
 };
-
 use winit::{dpi::PhysicalSize, window::Window};
 
 /// Vertex: position + color.
@@ -43,7 +42,7 @@ struct CameraUniform {
     mvp: [[f32; 4]; 4],
 }
 
-const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth32Float;
+const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus; // более совместим в WSL/GLES
 
 pub struct GpuState {
     // Surface
@@ -79,31 +78,83 @@ pub struct GpuState {
 
 /// Converts OpenGL clip space (z in [-1,1]) to WGPU/D3D clip (z in [0,1]).
 const OPENGL_TO_WGPU: glam::Mat4 = glam::Mat4::from_cols_array(&[
-    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.5, 0.0, 0.0, 0.0, 0.5, 1.0,
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 0.5, 0.0, //
+    0.0, 0.0, 0.5, 1.0,
 ]);
 
 impl GpuState {
-    /// Create GPU state bound to an Arc<Window>.
-    pub async fn new(window: Arc<Window>) -> Self {
+    /// Create GPU state bound to an Arc<Window>. Backends are selectable (A2).
+    pub async fn new(window: Arc<Window>, backends: wgpu::Backends) -> Self {
         let PhysicalSize { width, height } = window.inner_size();
         let width = width.max(1);
         let height = height.max(1);
 
-        // Instance & surface
-        let instance = Instance::new(&InstanceDescriptor::default());
-        let surface: Surface<'static> = instance
-            .create_surface(window.clone())
-            .expect("create_surface failed");
+        // Instance & surface with requested backends
+        let mut instance = Instance::new(&InstanceDescriptor {
+            backends,
+            ..Default::default()
+        });
+        let mut surface: Option<Surface<'static>> = instance.create_surface(window.clone()).ok();
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                power_preference: PowerPreference::HighPerformance,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            })
-            .await
-            .expect("No suitable GPU adapter");
+        let adapter = match surface.as_ref() {
+            Some(surf_ref) => {
+                match instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: PowerPreference::HighPerformance,
+                        compatible_surface: Some(surf_ref),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                {
+                    Ok(a) => a,
+                    Err(_) => {
+                        log::warn!(
+                            "No adapter for requested backends {:?}. Falling back to Backends::all()",
+                            backends
+                        );
+                        // fallback instance + surface
+                        instance = Instance::new(&InstanceDescriptor {
+                            backends: wgpu::Backends::all(),
+                            ..Default::default()
+                        });
+                        surface = instance.create_surface(window.clone()).ok();
+                        let surf_ref = surface.as_ref().expect("create_surface failed (fallback)");
+                        instance
+                            .request_adapter(&wgpu::RequestAdapterOptions {
+                                power_preference: PowerPreference::HighPerformance,
+                                compatible_surface: Some(surf_ref),
+                                force_fallback_adapter: false,
+                            })
+                            .await
+                            .expect("No suitable GPU adapter even on fallback")
+                    }
+                }
+            }
+            None => {
+                log::warn!(
+                    "Surface creation failed on requested backends {:?}. Falling back to Backends::all()",
+                    backends
+                );
+                instance = Instance::new(&InstanceDescriptor {
+                    backends: wgpu::Backends::all(),
+                    ..Default::default()
+                });
+                surface = instance.create_surface(window.clone()).ok();
+                let surf_ref = surface.as_ref().expect("create_surface failed (fallback)");
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: PowerPreference::HighPerformance,
+                        compatible_surface: Some(surf_ref),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .expect("No suitable GPU adapter even on fallback")
+            }
+        };
 
+        let surf = surface.expect("surface is None");
         let (device, queue) = adapter
             .request_device(&DeviceDescriptor {
                 label: Some("Svarog3D Device"),
@@ -117,7 +168,7 @@ impl GpuState {
             .expect("request_device failed");
 
         // Surface format (prefer sRGB)
-        let caps = surface.get_capabilities(&adapter);
+        let caps = surf.get_capabilities(&adapter);
         let surface_format = caps
             .formats
             .iter()
@@ -136,13 +187,13 @@ impl GpuState {
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
-        surface.configure(&device, &surface_config);
+        surf.configure(&device, &surface_config);
 
         // Depth texture
         let depth_view = create_depth_view(&device, &surface_config);
 
         // ==== Shaders ====
-        let shader_src: &str = include_str!("shaders/triangle.wgsl"); // переиспользуем файл, контент обновлён (см. ниже)
+        let shader_src: &str = include_str!("shaders/triangle.wgsl");
         let shader = device.create_shader_module(ShaderModuleDescriptor {
             label: Some("Basic WGSL"),
             source: ShaderSource::Wgsl(shader_src.into()),
@@ -164,8 +215,6 @@ impl GpuState {
                 count: None,
             }],
         });
-
-        // Initial camera (identity, заменим на реальное MVP в render()).
         let camera_init = CameraUniform {
             mvp: Mat4::IDENTITY.to_cols_array_2d(),
         };
@@ -208,8 +257,9 @@ impl GpuState {
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             }),
+            // Вариант A (твой): culling off — устраняет «пропадание» на WSL/GLES
             primitive: wgpu::PrimitiveState {
-                cull_mode: None, // Some(wgpu::Face::Back),
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: Some(DepthStencilState {
@@ -238,7 +288,7 @@ impl GpuState {
         });
 
         Self {
-            surface,
+            surface: surf,
             surface_format,
             surface_config,
             device,
@@ -273,11 +323,8 @@ impl GpuState {
         let t = self.start.elapsed().as_secs_f32();
         let aspect = self.width as f32 / self.height as f32;
         let proj = Mat4::perspective_rh(60f32.to_radians(), aspect, 0.1, 100.0);
-        // right-handed view (camera at +Z looking to origin)
         let view = Mat4::look_at_rh(Vec3::new(0.0, 0.0, 4.0), Vec3::ZERO, Vec3::Y);
         let model = Mat4::from_rotation_y(t) * Mat4::from_rotation_x(0.5 * t);
-
-        // Convert GL clip space -> WGPU clip space to match depth [0,1]
         let mvp = OPENGL_TO_WGPU * proj * view * model;
 
         let cam = CameraUniform {
@@ -404,13 +451,13 @@ fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
         }, // 7
     ];
     let idx: [u16; 36] = [
-        // front (+Z): counter-clockwise when viewed from outside
-        4, 6, 5, 4, 7, 6, // back (-Z): counter-clockwise when viewed from outside
-        0, 1, 2, 0, 2, 3, // top (+Y): counter-clockwise when viewed from outside
-        3, 6, 2, 3, 7, 6, // bottom (-Y): counter-clockwise when viewed from outside
-        0, 4, 5, 0, 5, 1, // left (-X): counter-clockwise when viewed from outside
-        0, 7, 3, 0, 4, 7, // right (+X): counter-clockwise when viewed from outside
-        1, 5, 6, 1, 6, 2,
+        // +Z
+        4, 5, 6, 4, 6, 7, // -Z
+        0, 2, 1, 0, 3, 2, // +Y
+        3, 6, 2, 3, 7, 6, // -Y
+        0, 1, 5, 0, 5, 4, // -X
+        0, 3, 7, 0, 7, 4, // +X
+        1, 2, 6, 1, 6, 5,
     ];
     (v.to_vec(), idx.to_vec())
 }

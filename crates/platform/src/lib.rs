@@ -3,6 +3,7 @@
 
 use anyhow::Result;
 use std::{env, sync::Arc};
+use wgpu;
 use winit::{
     application::ApplicationHandler,
     dpi::{LogicalSize, PhysicalSize},
@@ -12,7 +13,7 @@ use winit::{
 };
 
 /// Public entry: runs a window + renderer. Returns on close.
-pub fn run_with_renderer() -> Result<()> {
+pub fn run_with_renderer(backends: wgpu::Backends) -> Result<()> {
     log::info!(
         "Env: DISPLAY={:?}, WAYLAND_DISPLAY={:?}",
         env::var("DISPLAY").ok(),
@@ -20,7 +21,10 @@ pub fn run_with_renderer() -> Result<()> {
     );
 
     let event_loop: EventLoop<()> = EventLoop::new().expect("Failed to create event loop");
-    let mut app = App::default();
+    let mut app = App {
+        backends,
+        ..Default::default()
+    };
     event_loop
         .run_app(&mut app)
         .map_err(|e| anyhow::anyhow!(format!("{e:?}")))?;
@@ -31,6 +35,8 @@ pub fn run_with_renderer() -> Result<()> {
 struct App {
     gpu: Option<renderer::GpuState>,
     window: Option<Arc<Window>>,
+    // Конфиг
+    backends: wgpu::Backends,
 }
 
 impl ApplicationHandler for App {
@@ -51,7 +57,7 @@ impl ApplicationHandler for App {
         );
 
         // Init GPU (pass Arc<Window>)
-        let gpu = pollster::block_on(renderer::GpuState::new(window.clone()));
+        let gpu = pollster::block_on(renderer::GpuState::new(window.clone(), self.backends));
 
         // Low CPU at idle + первый кадр
         event_loop.set_control_flow(ControlFlow::Wait);

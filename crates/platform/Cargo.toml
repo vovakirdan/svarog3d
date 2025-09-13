@@ -10,3 +10,4 @@ anyhow.workspace = true
 winit = "0.30.12"
 pollster = "0.4.0"
 renderer = { path = "../renderer" }
+wgpu = "26.0.1"
