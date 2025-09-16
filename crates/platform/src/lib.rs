@@ -70,6 +70,9 @@ struct App {
 
     // Reusable per-frame draw list to avoid allocs
     draw_list: Vec<Transform>,
+
+    // Window state
+    is_minimized: bool,
 }
 
 impl ApplicationHandler for App {
@@ -141,6 +144,7 @@ impl ApplicationHandler for App {
         self.last_fps_instant = Some(Instant::now());
         self.last_time = Some(Instant::now());
         self.draw_list = Vec::with_capacity((grid_x * grid_y) as usize);
+        self.is_minimized = false;
     }
 
     fn window_event(
@@ -159,24 +163,31 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::Resized(new_size) => {
-                log::info!("Resized: {}x{}", new_size.width, new_size.height);
+                let w = new_size.width.max(0);
+                let h = new_size.height.max(0);
+                log::info!("Resized: {}x{}", w, h);
+            
+                self.is_minimized = w == 0 || h == 0;
+            
                 if let Some(gpu) = self.gpu.as_mut() {
-                    gpu.resize(new_size.width, new_size.height);
+                    gpu.resize(w, h);
                 }
-
-                // update camera aspect
-                if let Some(cam) = self.camera {
-                    let aspect = (new_size.width.max(1) as f32) / (new_size.height.max(1) as f32);
-                    let cam2 = Camera { aspect, ..cam };
-                    self.camera = Some(cam2);
-                    if let Some(gpu) = self.gpu.as_mut() {
-                        gpu.set_camera(&cam2);
+            
+                if !self.is_minimized {
+                    // обновляем aspect только если не ноль
+                    if let Some(cam) = self.camera {
+                        let aspect = (w.max(1) as f32) / (h.max(1) as f32);
+                        let cam2 = Camera { aspect, ..cam };
+                        self.camera = Some(cam2);
+                        if let Some(gpu) = self.gpu.as_mut() {
+                            gpu.set_camera(&cam2);
+                        }
+                    }
+                    if let Some(wnd) = &self.window {
+                        wnd.request_redraw();
                     }
                 }
-                if let Some(w) = &self.window {
-                    w.request_redraw();
-                }
-            }
+            }            
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
                 inner_size_writer: _,
@@ -184,6 +195,10 @@ impl ApplicationHandler for App {
                 log::info!("Scale factor changed: {:.3}", scale_factor);
             }
             WindowEvent::RedrawRequested => {
+                if self.is_minimized {
+                    // не анимируем, не рендерим
+                    return;
+                }
                 // dt
                 let dt = if let Some(t0) = self.last_time {
                     let d = t0.elapsed().as_secs_f32().max(1e-6);
@@ -206,11 +221,20 @@ impl ApplicationHandler for App {
 
                 // Render
                 if let Some(gpu) = self.gpu.as_mut() {
-                    if let Err(e) = gpu.render_models(&self.draw_list) {
-                        log::warn!("Render error: {e:?}");
-                        if renderer::GpuState::is_surface_lost(&e) {
-                            log::warn!("Surface lost/outdated. Recreating…");
-                            gpu.recreate_surface();
+                    match gpu.render_models(&self.draw_list) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            log::warn!("Render error: {e:?}");
+                            if renderer::GpuState::is_surface_lost(&e) {
+                                log::warn!("Surface lost/outdated. Recreating…");
+                                gpu.recreate_surface();
+                            } else if matches!(e, wgpu::SurfaceError::OutOfMemory) {
+                                log::error!("Out of GPU memory — exiting.");
+                                let _ = self.gpu.take();
+                                let _ = self.window.take();
+                                event_loop.exit();
+                                return;
+                            }
                         }
                     }
                 }

@@ -134,7 +134,7 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 
 [[package]]
 name = "app"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "env_logger",
@@ -172,7 +172,7 @@ dependencies = [
 
 [[package]]
 name = "asset"
-version = "0.1.7"
+version = "0.1.8"
 
 [[package]]
 name = "atomic-waker"
@@ -418,7 +418,7 @@ dependencies = [
 
 [[package]]
 name = "corelib"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "glam",
  "thiserror 2.0.16",
@@ -1312,7 +1312,7 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
 name = "platform"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "anyhow",
  "corelib",
@@ -1479,7 +1479,7 @@ checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
 
 [[package]]
 name = "renderer"
-version = "0.1.7"
+version = "0.1.8"
 dependencies = [
  "bytemuck",
  "corelib",

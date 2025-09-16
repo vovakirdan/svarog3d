@@ -392,13 +392,19 @@ impl GpuState {
 
     /// Resize: reconfigure surface & recreate depth view.
     pub fn resize(&mut self, width: u32, height: u32) {
-        self.width = width.max(1);
-        self.height = height.max(1);
+        self.width = width.max(0);
+        self.height = height.max(0);
+    
+        if self.width == 0 || self.height == 0 {
+            // окно свернуто/минимизировано — не трогаем surface
+            return;
+        }
+    
         self.surface_config.width = self.width;
         self.surface_config.height = self.height;
         self.surface.configure(&self.device, &self.surface_config);
         self.depth_view = create_depth_view(&self.device, &self.surface_config);
-    }
+    }   
 
     /// Render one frame: compute MVP from core::Camera/Transform, write UBO, draw cube.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
@@ -478,6 +484,10 @@ impl GpuState {
         &mut self,
         models: &[corelib::transform::Transform],
     ) -> Result<(), SurfaceError> {
+        if self.width == 0 || self.height == 0 {
+            // ничего не рисуем, окно свернуто
+            return Ok(());
+        }
         // 1) Подготовим массив инстансов (модельные матрицы)
         //    ОДНА аллокация на кадр у вызывающей стороны уже есть (draw_list),
         //    здесь — превращаем в InstanceRaw (можно использовать стаck-alloc via smallvec, но пока простое Vec).
@@ -511,7 +521,28 @@ impl GpuState {
         self.instance_count = instances.len() as u32;
 
         // 4) Рендер одним проходом и ОДНИМ draw_indexed с instance_count
-        let frame = self.surface.get_current_texture()?;
+        let frame = match self.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(e @ SurfaceError::Lost | e @ SurfaceError::Outdated) => {
+                // реконфигурируем и пропускаем кадр
+                self.recreate_surface();
+                return Err(e);
+            }
+            Err(SurfaceError::Timeout) => {
+                // вежливо пропускаем кадр без паники
+                log::warn!("Surface timeout — skipping this frame");
+                return Ok(());
+            }
+            Err(e @ SurfaceError::OutOfMemory) => {
+                // нехватка памяти — bubbling up (platform решит завершиться)
+                return Err(e);
+            }
+            Err(e @ SurfaceError::Other) => {
+                // другие ошибки — пропускаем кадр
+                log::warn!("Surface error: {:?} — skipping this frame", e);
+                return Ok(());
+            }
+        };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
             .device
