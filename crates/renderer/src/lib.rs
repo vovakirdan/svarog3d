@@ -5,8 +5,14 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
+use asset::mesh::{MeshData, MeshVertex};
 use bytemuck::{Pod, Zeroable};
-use corelib::{Mat4, Vec3, camera::Camera, transform::Transform};
+use corelib::{
+    Mat4, Vec3,
+    camera::Camera,
+    ecs::{MaterialId, MeshId},
+    transform::Transform,
+};
 use wgpu::{
     BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState, ColorWrites,
@@ -20,19 +26,49 @@ use wgpu::{
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
-/// Vertex: position + color.
+/// Vertex: position + normal + uv.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 pub struct Vertex {
-    pub pos: [f32; 3],
-    pub color: [f32; 3],
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub uv: [f32; 2],
 }
+
 impl Vertex {
     pub const LAYOUT: VertexBufferLayout<'static> = VertexBufferLayout {
         array_stride: std::mem::size_of::<Vertex>() as u64,
         step_mode: VertexStepMode::Vertex,
-        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3],
+        attributes: &wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2],
     };
+}
+
+impl From<MeshVertex> for Vertex {
+    fn from(v: MeshVertex) -> Self {
+        Self {
+            position: v.position,
+            normal: v.normal,
+            uv: v.uv,
+        }
+    }
+}
+
+/// CPU draw command passed from ECS/scene to renderer.
+#[derive(Clone, Copy, Debug)]
+pub struct DrawInstance {
+    pub transform: Transform,
+    pub mesh: MeshId,
+    pub material: MaterialId,
+}
+
+impl DrawInstance {
+    pub fn new(transform: Transform, mesh: MeshId, material: MaterialId) -> Self {
+        Self {
+            transform,
+            mesh,
+            material,
+        }
+    }
 }
 
 /// Per-instance model matrix as 4 **columns** (WGSL mat4x4 expects columns).
@@ -50,10 +86,10 @@ impl InstanceRaw {
         array_stride: std::mem::size_of::<InstanceRaw>() as u64,
         step_mode: VertexStepMode::Instance,
         attributes: &wgpu::vertex_attr_array![
-            2 => Float32x4, // col0
-            3 => Float32x4, // col1
-            4 => Float32x4, // col2
-            5 => Float32x4, // col3
+            3 => Float32x4, // col0
+            4 => Float32x4, // col1
+            5 => Float32x4, // col2
+            6 => Float32x4, // col3
         ],
     };
 
@@ -61,12 +97,77 @@ impl InstanceRaw {
         // glam::Mat4 хранится в column-major; берём колонки напрямую.
         let c = m.to_cols_array();
         Self {
-            col0: [c[0],  c[1],  c[2],  c[3]],
-            col1: [c[4],  c[5],  c[6],  c[7]],
-            col2: [c[8],  c[9],  c[10], c[11]],
+            col0: [c[0], c[1], c[2], c[3]],
+            col1: [c[4], c[5], c[6], c[7]],
+            col2: [c[8], c[9], c[10], c[11]],
             col3: [c[12], c[13], c[14], c[15]],
         }
     }
+}
+
+struct MeshGpu {
+    vertex_buf: Buffer,
+    index_buf: Buffer,
+    index_count: u32,
+    index_format: wgpu::IndexFormat,
+}
+
+struct MeshStore {
+    meshes: Vec<MeshGpu>,
+}
+
+impl MeshStore {
+    fn new() -> Self {
+        Self { meshes: Vec::new() }
+    }
+
+    fn add_mesh(&mut self, device: &Device, label: &str, mesh: &MeshData) -> MeshId {
+        assert!(mesh.is_valid(), "Mesh must contain vertices and indices");
+
+        let vertices: Vec<Vertex> = mesh.vertices.iter().copied().map(Vertex::from).collect();
+        let indices: &[u32] = &mesh.indices;
+
+        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("{label} VB")),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: BufferUsages::VERTEX,
+        });
+
+        let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some(&format!("{label} IB")),
+            contents: bytemuck::cast_slice(indices),
+            usage: BufferUsages::INDEX,
+        });
+
+        let index_count = u32::try_from(indices.len()).expect("index count exceeds u32");
+
+        let id_raw = u32::try_from(self.meshes.len()).expect("Too many meshes");
+        let id = MeshId::new(id_raw);
+        self.meshes.push(MeshGpu {
+            vertex_buf,
+            index_buf,
+            index_count,
+            index_format: wgpu::IndexFormat::Uint32,
+        });
+
+        id
+    }
+
+    fn get(&self, id: MeshId) -> Option<&MeshGpu> {
+        self.meshes.get(id.0 as usize)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct InstanceEntry {
+    mesh: MeshId,
+    instance: InstanceRaw,
+}
+
+struct MeshBatch {
+    mesh: MeshId,
+    start: usize,
+    count: usize,
 }
 
 /// Camera UBO (16-byte aligned).
@@ -99,12 +200,14 @@ pub struct GpuState {
 
     // Pipeline & geometry
     pipeline: RenderPipeline,
-    vertex_buf: Buffer,
-    index_buf: Buffer,
-    index_count: u32,
+    mesh_store: MeshStore,
+    cube_mesh_id: MeshId,
     instance_buf: Buffer,
     instance_capacity: u32,
     instance_count: u32,
+    instance_entries: Vec<InstanceEntry>,
+    instance_batches: Vec<MeshBatch>,
+    instance_data: Vec<InstanceRaw>,
 
     // Camera / model state (from core)
     camera: Camera,
@@ -330,18 +433,10 @@ impl GpuState {
             cache: None,
         });
 
-        // Geometry: indexed cube
-        let (vertices, indices) = cube_vertices();
-        let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Cube VB"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: BufferUsages::VERTEX,
-        });
-        let index_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Cube IB"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: BufferUsages::INDEX,
-        });
+        // Geometry: store meshes (start with built-in cube)
+        let mut mesh_store = MeshStore::new();
+        let cube_mesh = cube_mesh_data();
+        let cube_mesh_id = mesh_store.add_mesh(&device, "Cube", &cube_mesh);
 
         // Default camera/model (будут заданы снаружи)
         let camera = Camera::new_perspective(
@@ -362,9 +457,8 @@ impl GpuState {
             device,
             queue,
             pipeline,
-            vertex_buf,
-            index_buf,
-            index_count: indices.len() as u32,
+            mesh_store,
+            cube_mesh_id,
             camera_bgl,
             camera_bg,
             camera_buf,
@@ -377,6 +471,9 @@ impl GpuState {
             instance_buf,
             instance_capacity,
             instance_count: 0,
+            instance_entries: Vec::new(),
+            instance_batches: Vec::new(),
+            instance_data: Vec::new(),
         }
     }
 
@@ -390,85 +487,40 @@ impl GpuState {
         self.model = *model;
     }
 
+    /// Default cube mesh identifier.
+    pub fn cube_mesh_id(&self) -> MeshId {
+        self.cube_mesh_id
+    }
+
+    /// Upload mesh data to the GPU mesh store and receive a [`MeshId`].
+    pub fn upload_mesh(&mut self, label: &str, mesh: &MeshData) -> MeshId {
+        self.mesh_store.add_mesh(&self.device, label, mesh)
+    }
+
     /// Resize: reconfigure surface & recreate depth view.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(0);
         self.height = height.max(0);
-    
+
         if self.width == 0 || self.height == 0 {
             // окно свернуто/минимизировано — не трогаем surface
             return;
         }
-    
+
         self.surface_config.width = self.width;
         self.surface_config.height = self.height;
         self.surface.configure(&self.device, &self.surface_config);
         self.depth_view = create_depth_view(&self.device, &self.surface_config);
-    }   
+    }
 
     /// Render one frame: compute MVP from core::Camera/Transform, write UBO, draw cube.
     pub fn render(&mut self) -> Result<(), SurfaceError> {
-        // Compute MVP (GL-style PV → convert to WGPU NDC)
-        let pv = self.camera.proj_view();
-        let m = self.model.matrix();
-        let mvp = OPENGL_TO_WGPU * pv * m;
-        self.queue.write_buffer(
-            &self.camera_buf,
-            0,
-            bytemuck::bytes_of(&CameraUniform {
-                mvp: mvp.to_cols_array_2d(),
-            }),
-        );
-
-        // Acquire frame & encode pass
-        let frame = self.surface.get_current_texture()?;
-        let view = frame.texture.create_view(&Default::default());
-
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor {
-                label: Some("MainEncoder"),
-            });
-
-        {
-            let mut rpass = encoder.begin_render_pass(&RenderPassDescriptor {
-                label: Some("MainPass"),
-                color_attachments: &[Some(RenderPassColorAttachment {
-                    view: &view,
-                    depth_slice: None,
-                    resolve_target: None,
-                    ops: Operations {
-                        load: LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.08,
-                            a: 1.0,
-                        }),
-                        store: StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_view,
-                    depth_ops: Some(Operations {
-                        load: LoadOp::Clear(1.0),
-                        store: StoreOp::Store,
-                    }),
-                    stencil_ops: None,
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            rpass.set_pipeline(&self.pipeline);
-            rpass.set_bind_group(0, &self.camera_bg, &[]);
-            rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
-            rpass.draw_indexed(0..self.index_count, 0, 0..1);
-        }
-
-        self.queue.submit(Some(encoder.finish()));
-        frame.present();
-        Ok(())
+        let draw = [DrawInstance::new(
+            self.model,
+            self.cube_mesh_id,
+            MaterialId::INVALID,
+        )];
+        self.render_models(&draw)
     }
 
     pub fn is_surface_lost(err: &SurfaceError) -> bool {
@@ -479,30 +531,46 @@ impl GpuState {
         self.resize(self.width, self.height);
     }
 
-    /// Render a list of models (one draw call).
-    pub fn render_models(
-        &mut self,
-        models: &[corelib::transform::Transform],
-    ) -> Result<(), SurfaceError> {
+    /// Render a list of draw instances grouped by mesh/material.
+    pub fn render_models(&mut self, draw_list: &[DrawInstance]) -> Result<(), SurfaceError> {
         if self.width == 0 || self.height == 0 {
-            // ничего не рисуем, окно свернуто
             return Ok(());
         }
-        // 1) Подготовим массив инстансов (модельные матрицы)
-        //    ОДНА аллокация на кадр у вызывающей стороны уже есть (draw_list),
-        //    здесь — превращаем в InstanceRaw (можно использовать стаck-alloc via smallvec, но пока простое Vec).
-        let mut instances: Vec<InstanceRaw> = Vec::with_capacity(models.len());
-        let pv = self.camera.proj_view();
-        for m in models {
-            let model = m.matrix();
-            // Вершинный шейдер умножает: MVP * model * pos; здесь подаём только model как инстанс-атрибут.
-            instances.push(InstanceRaw::from_model(model));
+
+        self.instance_entries.clear();
+        self.instance_entries.reserve(draw_list.len());
+        for item in draw_list {
+            self.instance_entries.push(InstanceEntry {
+                mesh: item.mesh,
+                instance: InstanceRaw::from_model(item.transform.matrix()),
+            });
         }
 
-        // 2) Обновляем/расширяем буфер, если нужно (grow only, без лишних recreate)
-        let needed = (instances.len().max(1) as u64) * std::mem::size_of::<InstanceRaw>() as u64;
+        self.instance_entries.sort_by_key(|entry| entry.mesh);
+
+        self.instance_batches.clear();
+        self.instance_batches.reserve(self.instance_entries.len());
+        self.instance_data.clear();
+        self.instance_data.reserve(self.instance_entries.len());
+        let mut idx = 0;
+        while idx < self.instance_entries.len() {
+            let mesh = self.instance_entries[idx].mesh;
+            let batch_start = self.instance_data.len();
+            while idx < self.instance_entries.len() && self.instance_entries[idx].mesh == mesh {
+                self.instance_data.push(self.instance_entries[idx].instance);
+                idx += 1;
+            }
+            let batch_count = self.instance_data.len() - batch_start;
+            self.instance_batches.push(MeshBatch {
+                mesh,
+                start: batch_start,
+                count: batch_count,
+            });
+        }
+
+        let needed =
+            (self.instance_data.len().max(1) as u64) * std::mem::size_of::<InstanceRaw>() as u64;
         if needed > self.instance_buf.size() {
-            // Реаллоцируем с запасом (next power of two)
             let new_cap = needed.next_power_of_two();
             self.instance_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Instance Buffer (grown)"),
@@ -513,32 +581,27 @@ impl GpuState {
             self.instance_capacity = (new_cap / std::mem::size_of::<InstanceRaw>() as u64) as u32;
         }
 
-        // 3) Один upload на кадр
-        if !instances.is_empty() {
-            self.queue
-                .write_buffer(&self.instance_buf, 0, bytemuck::cast_slice(&instances));
+        if !self.instance_data.is_empty() {
+            self.queue.write_buffer(
+                &self.instance_buf,
+                0,
+                bytemuck::cast_slice(&self.instance_data),
+            );
         }
-        self.instance_count = instances.len() as u32;
+        self.instance_count = self.instance_data.len() as u32;
 
-        // 4) Рендер одним проходом и ОДНИМ draw_indexed с instance_count
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(e @ SurfaceError::Lost | e @ SurfaceError::Outdated) => {
-                // реконфигурируем и пропускаем кадр
                 self.recreate_surface();
                 return Err(e);
             }
             Err(SurfaceError::Timeout) => {
-                // вежливо пропускаем кадр без паники
                 log::warn!("Surface timeout — skipping this frame");
                 return Ok(());
             }
-            Err(e @ SurfaceError::OutOfMemory) => {
-                // нехватка памяти — bubbling up (platform решит завершиться)
-                return Err(e);
-            }
+            Err(e @ SurfaceError::OutOfMemory) => return Err(e),
             Err(e @ SurfaceError::Other) => {
-                // другие ошибки — пропускаем кадр
                 log::warn!("Surface error: {:?} — skipping this frame", e);
                 return Ok(());
             }
@@ -580,12 +643,9 @@ impl GpuState {
 
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.camera_bg, &[]);
-        rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-        rpass.set_vertex_buffer(1, self.instance_buf.slice(..)); // <--- инстансы
-        rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
 
-        // ВНИМАНИЕ: теперь шейдер умножает model из инстанса, поэтому здесь UBO `mvp` — это только PV!
-        let mvp = OPENGL_TO_WGPU * pv; // без model
+        let pv = self.camera.proj_view();
+        let mvp = OPENGL_TO_WGPU * pv;
         self.queue.write_buffer(
             &self.camera_buf,
             0,
@@ -594,7 +654,22 @@ impl GpuState {
             }),
         );
 
-        rpass.draw_indexed(0..self.index_count, 0, 0..self.instance_count);
+        let stride = std::mem::size_of::<InstanceRaw>() as u64;
+        for batch in &self.instance_batches {
+            if batch.count == 0 {
+                continue;
+            }
+            let Some(mesh) = self.mesh_store.get(batch.mesh) else {
+                log::warn!("Missing mesh id {:?}", batch.mesh);
+                continue;
+            };
+            let start = batch.start as u64 * stride;
+            let end = start + batch.count as u64 * stride;
+            rpass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
+            rpass.set_vertex_buffer(1, self.instance_buf.slice(start..end));
+            rpass.set_index_buffer(mesh.index_buf.slice(..), mesh.index_format);
+            rpass.draw_indexed(0..mesh.index_count, 0, 0..batch.count as u32);
+        }
         drop(rpass);
 
         self.queue.submit(Some(encoder.finish()));
@@ -621,50 +696,50 @@ fn create_depth_view(device: &Device, sc: &SurfaceConfiguration) -> TextureView 
     tex.create_view(&TextureViewDescriptor::default())
 }
 
-fn cube_vertices() -> (Vec<Vertex>, Vec<u16>) {
-    let v = [
-        // back z=-1
-        Vertex {
-            pos: [-1.0, -1.0, -1.0],
-            color: [1.0, 0.0, 0.0],
-        }, // 0
-        Vertex {
-            pos: [1.0, -1.0, -1.0],
-            color: [0.0, 1.0, 0.0],
-        }, // 1
-        Vertex {
-            pos: [1.0, 1.0, -1.0],
-            color: [0.0, 0.0, 1.0],
-        }, // 2
-        Vertex {
-            pos: [-1.0, 1.0, -1.0],
-            color: [1.0, 1.0, 0.0],
-        }, // 3
-        // front z=+1
-        Vertex {
-            pos: [-1.0, -1.0, 1.0],
-            color: [1.0, 0.0, 1.0],
-        }, // 4
-        Vertex {
-            pos: [1.0, -1.0, 1.0],
-            color: [0.0, 1.0, 1.0],
-        }, // 5
-        Vertex {
-            pos: [1.0, 1.0, 1.0],
-            color: [1.0, 1.0, 1.0],
-        }, // 6
-        Vertex {
-            pos: [-1.0, 1.0, 1.0],
-            color: [1.0, 0.5, 0.0],
-        }, // 7
+fn cube_mesh_data() -> MeshData {
+    use asset::mesh::MeshVertex;
+
+    let vertices = vec![
+        // +Z
+        MeshVertex::new([-1.0, -1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 0.0]),
+        MeshVertex::new([1.0, -1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 0.0]),
+        MeshVertex::new([1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [1.0, 1.0]),
+        MeshVertex::new([-1.0, 1.0, 1.0], [0.0, 0.0, 1.0], [0.0, 1.0]),
+        // -Z
+        MeshVertex::new([1.0, -1.0, -1.0], [0.0, 0.0, -1.0], [0.0, 0.0]),
+        MeshVertex::new([-1.0, -1.0, -1.0], [0.0, 0.0, -1.0], [1.0, 0.0]),
+        MeshVertex::new([-1.0, 1.0, -1.0], [0.0, 0.0, -1.0], [1.0, 1.0]),
+        MeshVertex::new([1.0, 1.0, -1.0], [0.0, 0.0, -1.0], [0.0, 1.0]),
+        // +X
+        MeshVertex::new([1.0, -1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 0.0]),
+        MeshVertex::new([1.0, -1.0, -1.0], [1.0, 0.0, 0.0], [1.0, 0.0]),
+        MeshVertex::new([1.0, 1.0, -1.0], [1.0, 0.0, 0.0], [1.0, 1.0]),
+        MeshVertex::new([1.0, 1.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0]),
+        // -X
+        MeshVertex::new([-1.0, -1.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 0.0]),
+        MeshVertex::new([-1.0, -1.0, 1.0], [-1.0, 0.0, 0.0], [1.0, 0.0]),
+        MeshVertex::new([-1.0, 1.0, 1.0], [-1.0, 0.0, 0.0], [1.0, 1.0]),
+        MeshVertex::new([-1.0, 1.0, -1.0], [-1.0, 0.0, 0.0], [0.0, 1.0]),
+        // +Y
+        MeshVertex::new([-1.0, 1.0, 1.0], [0.0, 1.0, 0.0], [0.0, 0.0]),
+        MeshVertex::new([1.0, 1.0, 1.0], [0.0, 1.0, 0.0], [1.0, 0.0]),
+        MeshVertex::new([1.0, 1.0, -1.0], [0.0, 1.0, 0.0], [1.0, 1.0]),
+        MeshVertex::new([-1.0, 1.0, -1.0], [0.0, 1.0, 0.0], [0.0, 1.0]),
+        // -Y
+        MeshVertex::new([-1.0, -1.0, -1.0], [0.0, -1.0, 0.0], [0.0, 0.0]),
+        MeshVertex::new([1.0, -1.0, -1.0], [0.0, -1.0, 0.0], [1.0, 0.0]),
+        MeshVertex::new([1.0, -1.0, 1.0], [0.0, -1.0, 0.0], [1.0, 1.0]),
+        MeshVertex::new([-1.0, -1.0, 1.0], [0.0, -1.0, 0.0], [0.0, 1.0]),
     ];
-    let idx: [u16; 36] = [
-        4, 5, 6, 4, 6, 7, // +Z
-        0, 2, 1, 0, 3, 2, // -Z
-        3, 6, 2, 3, 7, 6, // +Y
-        0, 1, 5, 0, 5, 4, // -Y
-        0, 3, 7, 0, 7, 4, // -X
-        1, 2, 6, 1, 6, 5, // +X
+
+    let indices: Vec<u32> = vec![
+        0, 1, 2, 0, 2, 3, // +Z
+        4, 5, 6, 4, 6, 7, // -Z
+        8, 9, 10, 8, 10, 11, // +X
+        12, 13, 14, 12, 14, 15, // -X
+        16, 17, 18, 16, 18, 19, // +Y
+        20, 21, 22, 20, 22, 23, // -Y
     ];
-    (v.to_vec(), idx.to_vec())
+
+    MeshData::new(vertices, indices)
 }

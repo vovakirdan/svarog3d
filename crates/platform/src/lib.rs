@@ -2,7 +2,7 @@
 //! Step B1 integration: create WGPU surface and clear screen.
 
 use anyhow::Result;
-use std::{env, sync::Arc, time::Instant};
+use std::{env, path::PathBuf, sync::Arc, time::Instant};
 use wgpu;
 use winit::{
     application::ApplicationHandler,
@@ -12,12 +12,14 @@ use winit::{
     window::{Window, WindowId},
 };
 
+use asset::obj;
 use corelib::{
     camera::Camera,
-    ecs::{MeshKind, Renderable, World},
+    ecs::{MaterialId, MeshId, Renderable, World},
     transform::Transform,
     vec3,
 };
+use renderer::DrawInstance;
 
 /// Public entry: runs a window + renderer. Returns on close.
 pub fn run_with_renderer(
@@ -69,10 +71,14 @@ struct App {
     camera: Option<Camera>,
 
     // Reusable per-frame draw list to avoid allocs
-    draw_list: Vec<Transform>,
+    draw_list: Vec<DrawInstance>,
 
     // Window state
     is_minimized: bool,
+
+    // Mesh handles
+    cube_mesh: MeshId,
+    suzanne_mesh: MeshId,
 }
 
 impl ApplicationHandler for App {
@@ -113,13 +119,44 @@ impl ApplicationHandler for App {
         self.camera = Some(camera);
         gpu.set_camera(&camera);
 
-        // Build scene: grid of cubes (e.g., 10x10)
+        // Mesh handles
+        let cube_mesh = gpu.cube_mesh_id();
+        let suzanne_mesh = {
+            let asset_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("assets")
+                .join("models")
+                .join("suzanne.obj");
+            match obj::load_obj_from_path(&asset_path) {
+                Ok(mesh) => {
+                    log::info!(
+                        "Loaded Suzanne OBJ ({} vertices, {} indices)",
+                        mesh.vertices.len(),
+                        mesh.indices.len()
+                    );
+                    gpu.upload_mesh("Suzanne", &mesh)
+                }
+                Err(err) => {
+                    log::error!(
+                        "Failed to load Suzanne OBJ from {}: {err:?}",
+                        asset_path.display()
+                    );
+                    cube_mesh
+                }
+            }
+        };
+        self.cube_mesh = cube_mesh;
+        self.suzanne_mesh = suzanne_mesh;
+
+        // Build scene: grid of cubes + Suzanne centerpiece
         self.world = World::new();
         let grid_x = 10u32;
         let grid_y = 10u32;
         let spacing = 2.5_f32;
         let origin_offset_x = (grid_x as f32 - 1.0) * spacing * 0.5;
         let origin_offset_y = (grid_y as f32 - 1.0) * spacing * 0.5;
+        let default_material = MaterialId::new(0);
 
         for gy in 0..grid_y {
             for gx in 0..grid_x {
@@ -127,12 +164,20 @@ impl ApplicationHandler for App {
                 let z = gy as f32 * spacing - origin_offset_y;
                 let t =
                     Transform::from_trs(vec3(x, 0.0, z), vec3(0.0, 0.0, 0.0), vec3(0.9, 0.9, 0.9));
-                let r = Renderable {
-                    mesh: MeshKind::Cube,
-                };
-                let _e = self.world.spawn(t, Some(r));
+                let r = Renderable::new(cube_mesh, default_material);
+                let _ = self.world.spawn(t, Some(r));
             }
         }
+
+        let suzanne_transform = Transform::from_trs(
+            vec3(0.0, 1.5, 0.0),
+            vec3(0.0, 0.0, 0.0),
+            vec3(1.6, 1.6, 1.6),
+        );
+        let suzanne_renderable = Renderable::new(suzanne_mesh, default_material);
+        let _ = self
+            .world
+            .spawn(suzanne_transform, Some(suzanne_renderable));
 
         // Control flow + first frame
         event_loop.set_control_flow(ControlFlow::Wait);
@@ -143,7 +188,7 @@ impl ApplicationHandler for App {
         self.frames = 0;
         self.last_fps_instant = Some(Instant::now());
         self.last_time = Some(Instant::now());
-        self.draw_list = Vec::with_capacity((grid_x * grid_y) as usize);
+        self.draw_list = Vec::with_capacity((grid_x * grid_y + 1) as usize);
         self.is_minimized = false;
     }
 
@@ -166,13 +211,13 @@ impl ApplicationHandler for App {
                 let w = new_size.width.max(0);
                 let h = new_size.height.max(0);
                 log::info!("Resized: {}x{}", w, h);
-            
+
                 self.is_minimized = w == 0 || h == 0;
-            
+
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(w, h);
                 }
-            
+
                 if !self.is_minimized {
                     // обновляем aspect только если не ноль
                     if let Some(cam) = self.camera {
@@ -187,7 +232,7 @@ impl ApplicationHandler for App {
                         wnd.request_redraw();
                     }
                 }
-            }            
+            }
             WindowEvent::ScaleFactorChanged {
                 scale_factor,
                 inner_size_writer: _,
@@ -214,9 +259,9 @@ impl ApplicationHandler for App {
 
                 // Build draw list WITHOUT allocation (reuse vector)
                 self.draw_list.clear();
-                for (t, _r) in self.world.iter_renderables() {
-                    // В будущем будем ветвиться по mesh/material; пока все кубы.
-                    self.draw_list.push(*t);
+                for (t, r) in self.world.iter_renderables() {
+                    self.draw_list
+                        .push(DrawInstance::new(*t, r.mesh, r.material));
                 }
 
                 // Render
