@@ -5,17 +5,43 @@ use crate::transform::Transform;
 /// Entity id (dense, index into component arrays).
 pub type Entity = u32;
 
-/// Simple mesh kind we can render without external assets.
-#[derive(Clone, Copy, Debug)]
-pub enum MeshKind {
-    Cube,
+/// Handle for a mesh stored on the GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MeshId(pub u32);
+
+impl MeshId {
+    pub const INVALID: MeshId = MeshId(u32::MAX);
+
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
 }
 
-/// Marker component: renderable with given mesh kind.
-/// (Материалы добавим позже)
+/// Handle for a material instance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MaterialId(pub u32);
+
+impl MaterialId {
+    pub const INVALID: MaterialId = MaterialId(u32::MAX);
+
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
+/// Marker component: renderable mesh + material handles.
 #[derive(Clone, Copy, Debug)]
 pub struct Renderable {
-    pub mesh: MeshKind,
+    pub mesh: MeshId,
+    pub material: MaterialId,
+}
+
+impl Renderable {
+    pub const fn new(mesh: MeshId, material: MaterialId) -> Self {
+        Self { mesh, material }
+    }
 }
 
 /// Very small ECS world with dense parallel arrays.
