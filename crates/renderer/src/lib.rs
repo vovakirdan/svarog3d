@@ -17,13 +17,13 @@ use corelib::{
     transform::Transform,
 };
 use wgpu::{
-    BindGroup, BindGroupLayout, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
+    BindGroup, BindGroupLayoutDescriptor, BindGroupLayoutEntry, BindingType,
     BlendState, Buffer, BufferBindingType, BufferUsages, ColorTargetState, ColorWrites,
     CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device, Extent3d, FragmentState,
     Instance, InstanceDescriptor, LoadOp, Operations, PipelineLayoutDescriptor, PowerPreference,
     PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
     RenderPipelineDescriptor, Sampler, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
-    ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError, Texture, TextureDescriptor,
+    ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError, TextureDescriptor,
     TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
     TextureViewDimension, VertexBufferLayout, VertexState, VertexStepMode, util::DeviceExt,
 };
@@ -162,7 +162,6 @@ impl MeshStore {
 }
 
 struct TextureGpu {
-    texture: Texture,
     view: TextureView,
     sampler: Sampler,
 }
@@ -224,7 +223,6 @@ impl TextureStore {
         let id_raw = u32::try_from(self.textures.len()).expect("Too many textures");
         let id = TextureId::new(id_raw);
         self.textures.push(TextureGpu {
-            texture,
             view,
             sampler,
         });
@@ -254,6 +252,46 @@ struct MeshBatch {
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct CameraUniform {
     mvp: [[f32; 4]; 4],
+}
+
+/// Material properties (16-byte aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MaterialUniform {
+    pub base_color: [f32; 4],    // RGBA albedo
+    pub metallic_roughness: [f32; 2], // metallic, roughness
+    pub _padding: [f32; 2],      // Pad to 16 bytes
+}
+
+impl Default for MaterialUniform {
+    fn default() -> Self {
+        Self {
+            base_color: [0.8, 0.8, 0.9, 1.0],
+            metallic_roughness: [0.0, 0.5],
+            _padding: [0.0, 0.0],
+        }
+    }
+}
+
+/// Lighting parameters (16-byte aligned).
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct LightingUniform {
+    pub light_direction: [f32; 3], // Directional light dir
+    pub light_intensity: f32,      // Light intensity
+    pub light_color: [f32; 3],     // Light color (RGB)
+    pub ambient_intensity: f32,    // Ambient light intensity
+}
+
+impl Default for LightingUniform {
+    fn default() -> Self {
+        Self {
+            light_direction: [-0.5, 1.0, -0.3],
+            light_intensity: 1.0,
+            light_color: [1.0, 1.0, 1.0],
+            ambient_intensity: 0.3,
+        }
+    }
 }
 
 const DEPTH_FORMAT: TextureFormat = TextureFormat::Depth24Plus;
@@ -295,11 +333,11 @@ pub struct GpuState {
     model: Transform,
 
     // Bindings
-    #[allow(dead_code)]
-    camera_bgl: BindGroupLayout,
     camera_bg: BindGroup,
     camera_buf: Buffer,
-    texture_bgl: BindGroupLayout,
+    material_bg: BindGroup,
+    material_buf: Buffer,
+    lighting_buf: Buffer,
     texture_bg: BindGroup,
 
     // Depth
@@ -467,6 +505,64 @@ impl GpuState {
             }],
         });
 
+        // Material/Lighting BGL/BG
+        let material_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Material BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(
+                            NonZeroU64::new(std::mem::size_of::<MaterialUniform>() as u64).unwrap(),
+                        ),
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: Some(
+                            NonZeroU64::new(std::mem::size_of::<LightingUniform>() as u64).unwrap(),
+                        ),
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let material_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Material UBO"),
+            contents: bytemuck::bytes_of(&MaterialUniform::default()),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let lighting_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Lighting UBO"),
+            contents: bytemuck::bytes_of(&LightingUniform::default()),
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        });
+
+        let material_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Material BG"),
+            layout: &material_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: material_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lighting_buf.as_entire_binding(),
+                },
+            ],
+        });
+
         // Texture store with default texture
         let mut texture_store = TextureStore::new();
         let default_texture_data = TextureData::create_test_texture(64);
@@ -522,7 +618,7 @@ impl GpuState {
         // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Basic PipelineLayout"),
-            bind_group_layouts: &[&camera_bgl, &texture_bgl],
+            bind_group_layouts: &[&camera_bgl, &material_bgl, &texture_bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -589,10 +685,11 @@ impl GpuState {
             cube_mesh_id,
             texture_store,
             default_texture_id,
-            camera_bgl,
             camera_bg,
             camera_buf,
-            texture_bgl,
+            material_bg,
+            material_buf,
+            lighting_buf,
             texture_bg,
             depth_view,
             start: Instant::now(),
@@ -637,6 +734,24 @@ impl GpuState {
     /// Get the default texture ID.
     pub fn default_texture_id(&self) -> TextureId {
         self.default_texture_id
+    }
+
+    /// Update material properties.
+    pub fn update_material(&self, material: &MaterialUniform) {
+        self.queue.write_buffer(
+            &self.material_buf,
+            0,
+            bytemuck::bytes_of(material),
+        );
+    }
+
+    /// Update lighting properties.
+    pub fn update_lighting(&self, lighting: &LightingUniform) {
+        self.queue.write_buffer(
+            &self.lighting_buf,
+            0,
+            bytemuck::bytes_of(lighting),
+        );
     }
 
     /// Resize: reconfigure surface & recreate depth view.
@@ -785,7 +900,8 @@ impl GpuState {
 
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.camera_bg, &[]);
-        rpass.set_bind_group(1, &self.texture_bg, &[]);
+        rpass.set_bind_group(1, &self.material_bg, &[]);
+        rpass.set_bind_group(2, &self.texture_bg, &[]);
 
         let pv = self.camera.proj_view();
         let mvp = OPENGL_TO_WGPU * pv;

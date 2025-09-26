@@ -19,7 +19,7 @@ use corelib::{
     transform::Transform,
     vec3,
 };
-use renderer::DrawInstance;
+use renderer::{DrawInstance, LightingUniform, MaterialUniform};
 
 /// Public entry: runs a window + renderer. Returns on close.
 pub fn run_with_renderer(
@@ -277,6 +277,34 @@ impl ApplicationHandler for App {
 
                 // Animate: rotate all transforms a bit
                 self.world.system_rotate_all(dt, [0.3, 0.6, 0.0]);
+
+                // Update dynamic lighting
+                if let Some(gpu) = self.gpu.as_mut() {
+                    let time = self.last_time.map_or(0.0, |t| t.elapsed().as_secs_f32());
+
+                    // Rotate light direction over time
+                    let light_angle = time * 0.5;
+                    let lighting = LightingUniform {
+                        light_direction: [
+                            light_angle.cos() * 0.5,
+                            1.0,
+                            light_angle.sin() * 0.3,
+                        ],
+                        light_intensity: 1.0,
+                        light_color: [1.0, 0.9, 0.8], // Warm white light
+                        ambient_intensity: 0.2,
+                    };
+                    gpu.update_lighting(&lighting);
+
+                    // Update material with slight color variation
+                    let material_hue = (time * 0.3).sin() * 0.1 + 0.8;
+                    let material = MaterialUniform {
+                        base_color: [material_hue, material_hue, 1.0, 1.0],
+                        metallic_roughness: [0.1, 0.6],
+                        _padding: [0.0, 0.0],
+                    };
+                    gpu.update_material(&material);
+                }
 
                 // Build draw list WITHOUT allocation (reuse vector)
                 self.draw_list.clear();
