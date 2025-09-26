@@ -10,7 +10,7 @@ glam = "0.30.5"
 log.workspace = true
 parking_lot = "0.12.4"
 pollster = "0.4.0"
-wgpu = "26.0.1"
+wgpu = "23.0.1"
 winit = "0.30.12"
 corelib = { path = "../corelib" }
 asset = { path = "../asset" }

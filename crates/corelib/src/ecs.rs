@@ -134,4 +134,9 @@ impl World {
             }
         }
     }
+
+    /// Get the count of alive entities.
+    pub fn entity_count(&self) -> usize {
+        self.alive.iter().filter(|&&alive| alive).count()
+    }
 }

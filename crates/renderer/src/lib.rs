@@ -223,7 +223,6 @@ impl TextureStore {
             mip_level_count: None,
             base_array_layer: 0,
             array_layer_count: None,
-            usage: None,
         });
 
         let sampler = device.create_sampler(&SamplerDescriptor {
@@ -389,7 +388,7 @@ impl GpuState {
         let height = height.max(1);
 
         // Instance & surface with requested backends
-        let mut instance = Instance::new(&InstanceDescriptor {
+        let mut instance = Instance::new(InstanceDescriptor {
             backends,
             ..Default::default()
         });
@@ -406,13 +405,13 @@ impl GpuState {
                     })
                     .await
                 {
-                    Ok(a) => a,
-                    Err(_) => {
+                    Some(a) => a,
+                    None => {
                         log::warn!(
                             "No adapter for requested backends {:?}. Falling back to Backends::all()",
                             backends
                         );
-                        instance = Instance::new(&InstanceDescriptor {
+                        instance = Instance::new(InstanceDescriptor {
                             backends: wgpu::Backends::all(),
                             ..Default::default()
                         });
@@ -436,7 +435,7 @@ impl GpuState {
                     "Surface creation failed on requested backends {:?}. Falling back to Backends::all()",
                     backends
                 );
-                instance = Instance::new(&InstanceDescriptor {
+                instance = Instance::new(InstanceDescriptor {
                     backends: wgpu::Backends::all(),
                     ..Default::default()
                 });
@@ -464,8 +463,7 @@ impl GpuState {
                 required_limits: wgpu::Limits::downlevel_webgl2_defaults()
                     .using_resolution(adapter.limits()),
                 memory_hints: Default::default(),
-                trace: Default::default(),
-            })
+            }, None)
             .await
             .expect("request_device failed");
 
@@ -973,10 +971,6 @@ impl GpuState {
                 return Ok(());
             }
             Err(e @ SurfaceError::OutOfMemory) => return Err(e),
-            Err(e @ SurfaceError::Other) => {
-                log::warn!("Surface error: {:?} — skipping this frame", e);
-                return Ok(());
-            }
         };
         let view = frame.texture.create_view(&Default::default());
         let mut encoder = self
@@ -989,7 +983,6 @@ impl GpuState {
             label: Some("MainPass"),
             color_attachments: &[Some(RenderPassColorAttachment {
                 view: &view,
-                depth_slice: None,
                 resolve_target: None,
                 ops: Operations {
                     load: LoadOp::Clear(wgpu::Color {
@@ -1087,6 +1080,37 @@ impl GpuState {
         self.queue.submit(Some(encoder.finish()));
         frame.present();
         Ok(())
+    }
+
+
+    /// Get device reference for egui integration.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Get surface format for egui integration.
+    pub fn surface_format(&self) -> TextureFormat {
+        self.surface_format
+    }
+
+    /// Get queue reference for egui integration.
+    pub fn queue(&self) -> &Queue {
+        &self.queue
+    }
+
+    /// Get surface reference for egui integration.
+    pub fn surface(&self) -> &Surface {
+        &self.surface
+    }
+
+    /// Get width for egui integration.
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Get height for egui integration.
+    pub fn height(&self) -> u32 {
+        self.height
     }
 }
 

@@ -11,6 +11,8 @@ use winit::{
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
     window::{Window, WindowId},
 };
+use egui_winit::State as EguiWinitState;
+use egui_wgpu::Renderer as EguiRenderer;
 
 use asset::{obj, texture::TextureData};
 use corelib::{
@@ -40,6 +42,8 @@ pub fn run_with_renderer(
         show_fps,
         width,
         height,
+        egui_state: None,
+        egui_renderer: None,
         ..Default::default()
     };
     event_loop
@@ -79,6 +83,10 @@ struct App {
     // Mesh handles
     cube_mesh: MeshId,
     suzanne_mesh: MeshId,
+
+    // egui state
+    egui_state: Option<EguiWinitState>,
+    egui_renderer: Option<EguiRenderer>,
 }
 
 impl ApplicationHandler for App {
@@ -148,6 +156,26 @@ impl ApplicationHandler for App {
         };
         self.cube_mesh = cube_mesh;
         self.suzanne_mesh = suzanne_mesh;
+
+        // Initialize egui
+        let egui_context = egui::Context::default();
+        let egui_state = EguiWinitState::new(
+            egui_context,
+            egui::ViewportId::ROOT,
+            &window,
+            Some(window.scale_factor() as f32),
+            None,
+            Some(2048),
+        );
+        let egui_renderer = EguiRenderer::new(
+            gpu.device(),
+            gpu.surface_format(),
+            None,
+            1,
+            false,
+        );
+        self.egui_state = Some(egui_state);
+        self.egui_renderer = Some(egui_renderer);
 
         // G2: Setup FrameGraph example
         gpu.setup_framegraph_example();
@@ -222,6 +250,11 @@ impl ApplicationHandler for App {
         _window_id: WindowId,
         event: WindowEvent,
     ) {
+        // Handle egui events first
+        if let Some(egui_state) = &mut self.egui_state {
+            let _ = egui_state.on_window_event(self.window.as_ref().unwrap(), &event);
+        }
+
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("Close requested. Exiting.");
@@ -321,7 +354,7 @@ impl ApplicationHandler for App {
                     self.draw_list.push(DrawInstance::new(*t, r.mesh, r.material, default_texture));
                 }
 
-                // Render
+                // Render 3D scene (I1: egui framework integrated)
                 if let Some(gpu) = self.gpu.as_mut() {
                     match gpu.render_models(&self.draw_list) {
                         Ok(()) => {}
@@ -340,6 +373,10 @@ impl ApplicationHandler for App {
                         }
                     }
                 }
+
+                // I1: Process egui events and prepare UI (rendering overlay TODO in I2)
+                self.process_egui_frame();
+
                 // FPS: счёт и обновление заголовка раз в ~1 сек
                 if self.show_fps {
                     self.frames += 1;
@@ -375,3 +412,88 @@ impl ApplicationHandler for App {
         }
     }
 }
+
+impl App {
+    /// Process egui events and prepare UI frame (I1 - ready for I2 overlay rendering).
+    fn process_egui_frame(&mut self) {
+        if let (Some(egui_state), Some(window)) = (
+            self.egui_state.as_mut(),
+            self.window.as_ref(),
+        ) {
+            let raw_input = egui_state.take_egui_input(window);
+
+            // Prepare UI data outside the closure to avoid borrow conflicts
+            let entity_count = self.world.entity_count();
+            let fps = if self.show_fps {
+                if let Some(t0) = self.last_fps_instant {
+                    self.frames as f32 / t0.elapsed().as_secs_f32()
+                } else {
+                    0.0
+                }
+            } else {
+                0.0
+            };
+            let camera_info = self.camera.as_ref().map(|c| (c.eye, c.target, c.fov_y_rad));
+            let mesh_info = (self.cube_mesh, self.suzanne_mesh);
+
+            let full_output = egui_state.egui_ctx().run(raw_input, |ctx| {
+                Self::draw_ui_content(ctx, entity_count, fps, self.show_fps, camera_info, mesh_info);
+            });
+
+            egui_state.handle_platform_output(window, full_output.platform_output);
+
+            // I1 Complete: egui framework integrated and UI prepared
+            // Next: I2 will add camera controls and visual overlay rendering
+        }
+    }
+
+    /// Draw the egui UI content (I1).
+    fn draw_ui_content(
+        ctx: &egui::Context,
+        entity_count: usize,
+        fps: f32,
+        show_fps: bool,
+        camera_info: Option<(corelib::Vec3, corelib::Vec3, f32)>,
+        mesh_info: (corelib::ecs::MeshId, corelib::ecs::MeshId),
+    ) {
+        // I1: Basic UI panels
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("Svarog3D");
+                ui.separator();
+                ui.label(format!("Objects: {}", entity_count));
+                ui.separator();
+                if show_fps {
+                    ui.label(format!("FPS: {:.1}", fps));
+                }
+            });
+        });
+
+        egui::SidePanel::left("left_panel").show(ctx, |ui| {
+            ui.heading("Scene Inspector");
+            ui.separator();
+
+            if let Some((eye, target, fov)) = camera_info {
+                ui.collapsing("Camera", |ui| {
+                    ui.label(format!("Eye: {:.2}, {:.2}, {:.2}", eye.x, eye.y, eye.z));
+                    ui.label(format!("Target: {:.2}, {:.2}, {:.2}", target.x, target.y, target.z));
+                    ui.label(format!("FOV: {:.1}°", fov.to_degrees()));
+                });
+            }
+
+            ui.separator();
+            ui.collapsing("Lighting", |ui| {
+                ui.label("Dynamic directional light");
+                ui.label("Blinn-Phong shading");
+                ui.label("Ambient + Diffuse + Specular");
+            });
+
+            ui.separator();
+            ui.collapsing("Meshes", |ui| {
+                ui.label(format!("Cube mesh: {:?}", mesh_info.0));
+                ui.label(format!("Suzanne mesh: {:?}", mesh_info.1));
+            });
+        });
+    }
+}
+

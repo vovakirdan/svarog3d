@@ -10,6 +10,9 @@ anyhow.workspace = true
 winit = "0.30.12"
 pollster = "0.4.0"
 renderer = { path = "../renderer" }
-wgpu = "26.0.1"
+wgpu = "23.0.1"
 corelib = { path = "../corelib" }
 asset = { path = "../asset" }
+egui = "0.30.0"
+egui-winit = "0.30.0"
+egui-wgpu = "0.30.0"
