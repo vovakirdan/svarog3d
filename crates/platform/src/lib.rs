@@ -149,6 +149,9 @@ impl ApplicationHandler for App {
         self.cube_mesh = cube_mesh;
         self.suzanne_mesh = suzanne_mesh;
 
+        // G2: Setup FrameGraph example
+        gpu.setup_framegraph_example();
+
         // Load texture
         let _default_texture = {
             let texture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -309,8 +312,13 @@ impl ApplicationHandler for App {
                 // Build draw list WITHOUT allocation (reuse vector)
                 self.draw_list.clear();
                 for (t, r) in self.world.iter_renderables() {
-                    self.draw_list
-                        .push(DrawInstance::new(*t, r.mesh, r.material));
+                    // Use default texture for now - could be extended to per-entity textures
+                    let default_texture = if let Some(gpu) = self.gpu.as_ref() {
+                        gpu.default_texture_id()
+                    } else {
+                        corelib::ecs::TextureId::INVALID
+                    };
+                    self.draw_list.push(DrawInstance::new(*t, r.mesh, r.material, default_texture));
                 }
 
                 // Render

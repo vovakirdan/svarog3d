@@ -1,9 +1,14 @@
 //! Renderer: wgpu init + depth + cube.
 //! D1: camera/transform from `core` with setters.
+//! G2: Mini-FrameGraph system for explicit render passes.
+
+pub mod framegraph;
 
 use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
+
+use crate::framegraph::{FrameGraph, ResourceDesc};
 
 use asset::{
     mesh::{MeshData, MeshVertex},
@@ -62,14 +67,25 @@ pub struct DrawInstance {
     pub transform: Transform,
     pub mesh: MeshId,
     pub material: MaterialId,
+    pub texture: TextureId,
 }
 
 impl DrawInstance {
-    pub fn new(transform: Transform, mesh: MeshId, material: MaterialId) -> Self {
+    pub fn new(transform: Transform, mesh: MeshId, material: MaterialId, texture: TextureId) -> Self {
         Self {
             transform,
             mesh,
             material,
+            texture,
+        }
+    }
+
+    pub fn new_with_default_texture(transform: Transform, mesh: MeshId, material: MaterialId) -> Self {
+        Self {
+            transform,
+            mesh,
+            material,
+            texture: TextureId::INVALID, // Will be replaced with default texture
         }
     }
 }
@@ -235,14 +251,24 @@ impl TextureStore {
     }
 }
 
+/// Sorting key for draw commands to minimize state changes.
+/// Sort order: PSO (Pipeline) -> Material -> Texture -> Mesh -> Instance
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct DrawKey {
+    pso_id: u32,       // Pipeline state object (currently always 0)
+    material: MaterialId,
+    texture: TextureId,
+    mesh: MeshId,
+}
+
 #[derive(Clone, Copy)]
 struct InstanceEntry {
-    mesh: MeshId,
+    key: DrawKey,
     instance: InstanceRaw,
 }
 
-struct MeshBatch {
-    mesh: MeshId,
+struct DrawBatch {
+    key: DrawKey,
     start: usize,
     count: usize,
 }
@@ -325,7 +351,7 @@ pub struct GpuState {
     instance_capacity: u32,
     instance_count: u32,
     instance_entries: Vec<InstanceEntry>,
-    instance_batches: Vec<MeshBatch>,
+    draw_batches: Vec<DrawBatch>,
     instance_data: Vec<InstanceRaw>,
 
     // Camera / model state (from core)
@@ -342,6 +368,9 @@ pub struct GpuState {
 
     // Depth
     depth_view: TextureView,
+
+    // G2: FrameGraph system
+    framegraph: FrameGraph,
 
     // Time (only for FPS in platform; left here in case we need timers)
     #[allow(dead_code)]
@@ -692,6 +721,7 @@ impl GpuState {
             lighting_buf,
             texture_bg,
             depth_view,
+            framegraph: FrameGraph::new(),
             start: Instant::now(),
             camera,
             model,
@@ -701,7 +731,7 @@ impl GpuState {
             instance_capacity,
             instance_count: 0,
             instance_entries: Vec::new(),
-            instance_batches: Vec::new(),
+            draw_batches: Vec::new(),
             instance_data: Vec::new(),
         }
     }
@@ -754,6 +784,56 @@ impl GpuState {
         );
     }
 
+    /// G2: Setup a simple framegraph example with post-processing.
+    /// This demonstrates how easy it is to add post-effects without touching existing code.
+    pub fn setup_framegraph_example(&mut self) {
+        use crate::framegraph::{PassDesc, ResourceUsage};
+
+        // Clear existing framegraph
+        self.framegraph = FrameGraph::new();
+
+        // G2: Create intermediate render target for main scene
+        let scene_target = self.framegraph.add_resource(ResourceDesc {
+            label: "SceneTarget".to_string(),
+            width: self.width,
+            height: self.height,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        });
+
+        // G2: Create main scene render pass
+        let _main_pass = self.framegraph.add_pass(
+            PassDesc {
+                label: "MainScenePass".to_string(),
+                inputs: vec![], // No inputs for the main pass
+                outputs: vec![(scene_target, ResourceUsage::Write)],
+            },
+            Box::new(|_render_pass, _resources| {
+                // In a real implementation, this would render the main scene
+                // For now, just a placeholder to show the concept
+                log::info!("G2: Executing main scene pass");
+            }),
+        );
+
+        // G2: Create post-processing pass (gamma correction example)
+        let _post_pass = self.framegraph.add_pass(
+            PassDesc {
+                label: "PostProcessPass".to_string(),
+                inputs: vec![(scene_target, ResourceUsage::Read)],
+                outputs: vec![], // Output to swapchain
+            },
+            Box::new(|_render_pass, resources| {
+                // In a real implementation, this would apply post-processing
+                log::info!("G2: Executing post-processing pass with {} resources", resources.len());
+            }),
+        );
+
+        // G2: Compile the framegraph
+        self.framegraph.compile(&self.device);
+
+        log::info!("G2: FrameGraph setup complete - main pass -> post pass");
+    }
+
     /// Resize: reconfigure surface & recreate depth view.
     pub fn resize(&mut self, width: u32, height: u32) {
         self.width = width.max(0);
@@ -776,6 +856,7 @@ impl GpuState {
             self.model,
             self.cube_mesh_id,
             MaterialId::INVALID,
+            self.default_texture_id,
         )];
         self.render_models(&draw)
     }
@@ -788,38 +869,72 @@ impl GpuState {
         self.resize(self.width, self.height);
     }
 
-    /// Render a list of draw instances grouped by mesh/material.
+    /// Render a list of draw instances with optimized batching (G1).
+    /// Sort order: PSO -> Material -> Texture -> Mesh to minimize state changes.
     pub fn render_models(&mut self, draw_list: &[DrawInstance]) -> Result<(), SurfaceError> {
         if self.width == 0 || self.height == 0 {
             return Ok(());
         }
 
+        // G1: Prepare and sort draw commands for optimal batching
         self.instance_entries.clear();
         self.instance_entries.reserve(draw_list.len());
+
         for item in draw_list {
-            self.instance_entries.push(InstanceEntry {
+            // Replace INVALID texture with default texture
+            let texture = if item.texture == TextureId::INVALID {
+                self.default_texture_id
+            } else {
+                item.texture
+            };
+
+            let key = DrawKey {
+                pso_id: 0, // Currently only one PSO
+                material: item.material,
+                texture,
                 mesh: item.mesh,
+            };
+
+            self.instance_entries.push(InstanceEntry {
+                key,
                 instance: InstanceRaw::from_model(item.transform.matrix()),
             });
         }
 
-        self.instance_entries.sort_by_key(|entry| entry.mesh);
+        // G1: Sort by DrawKey (PSO -> Material -> Texture -> Mesh)
+        self.instance_entries.sort_by_key(|entry| entry.key);
 
-        self.instance_batches.clear();
-        self.instance_batches.reserve(self.instance_entries.len());
+        // G1: Create batches with same render state
+        self.draw_batches.clear();
+        self.draw_batches.reserve(self.instance_entries.len());
         self.instance_data.clear();
         self.instance_data.reserve(self.instance_entries.len());
-        let mut idx = 0;
-        while idx < self.instance_entries.len() {
-            let mesh = self.instance_entries[idx].mesh;
-            let batch_start = self.instance_data.len();
-            while idx < self.instance_entries.len() && self.instance_entries[idx].mesh == mesh {
-                self.instance_data.push(self.instance_entries[idx].instance);
-                idx += 1;
+
+        if !self.instance_entries.is_empty() {
+            let mut batch_start = 0;
+            let mut current_key = self.instance_entries[0].key;
+
+            for (idx, entry) in self.instance_entries.iter().enumerate() {
+                if entry.key != current_key {
+                    // End current batch
+                    let batch_count = idx - batch_start;
+                    self.draw_batches.push(DrawBatch {
+                        key: current_key,
+                        start: batch_start,
+                        count: batch_count,
+                    });
+
+                    // Start new batch
+                    batch_start = idx;
+                    current_key = entry.key;
+                }
+                self.instance_data.push(entry.instance);
             }
-            let batch_count = self.instance_data.len() - batch_start;
-            self.instance_batches.push(MeshBatch {
-                mesh,
+
+            // Add final batch
+            let batch_count = self.instance_entries.len() - batch_start;
+            self.draw_batches.push(DrawBatch {
+                key: current_key,
                 start: batch_start,
                 count: batch_count,
             });
@@ -898,11 +1013,11 @@ impl GpuState {
             timestamp_writes: None,
         });
 
+        // Set initial pipeline state
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.camera_bg, &[]);
-        rpass.set_bind_group(1, &self.material_bg, &[]);
-        rpass.set_bind_group(2, &self.texture_bg, &[]);
 
+        // Update camera uniforms once per frame
         let pv = self.camera.proj_view();
         let mvp = OPENGL_TO_WGPU * pv;
         self.queue.write_buffer(
@@ -913,21 +1028,59 @@ impl GpuState {
             }),
         );
 
+        // G1: Render batches with minimal state changes
         let stride = std::mem::size_of::<InstanceRaw>() as u64;
-        for batch in &self.instance_batches {
+        let mut current_material = MaterialId::INVALID;
+        let mut current_texture = TextureId::INVALID;
+        let mut state_changes = 0u32;
+
+        for batch in &self.draw_batches {
             if batch.count == 0 {
                 continue;
             }
-            let Some(mesh) = self.mesh_store.get(batch.mesh) else {
-                log::warn!("Missing mesh id {:?}", batch.mesh);
+
+            let key = batch.key;
+
+            // G1: Only change material bind group when material changes
+            if key.material != current_material {
+                rpass.set_bind_group(1, &self.material_bg, &[]);
+                current_material = key.material;
+                state_changes += 1;
+            }
+
+            // G1: Only change texture bind group when texture changes
+            if key.texture != current_texture {
+                // For now, we use the same texture bind group for all textures
+                // In a full implementation, we'd have different bind groups per texture
+                rpass.set_bind_group(2, &self.texture_bg, &[]);
+                current_texture = key.texture;
+                state_changes += 1;
+            }
+
+            // Get mesh data
+            let Some(mesh) = self.mesh_store.get(key.mesh) else {
+                log::warn!("Missing mesh id {:?}", key.mesh);
                 continue;
             };
-            let start = batch.start as u64 * stride;
-            let end = start + batch.count as u64 * stride;
+
+            // Set vertex/index buffers and draw
+            let instance_start = batch.start as u64 * stride;
+            let instance_end = instance_start + batch.count as u64 * stride;
+
             rpass.set_vertex_buffer(0, mesh.vertex_buf.slice(..));
-            rpass.set_vertex_buffer(1, self.instance_buf.slice(start..end));
+            rpass.set_vertex_buffer(1, self.instance_buf.slice(instance_start..instance_end));
             rpass.set_index_buffer(mesh.index_buf.slice(..), mesh.index_format);
             rpass.draw_indexed(0..mesh.index_count, 0, 0..batch.count as u32);
+        }
+
+        // G1: Log state changes for performance monitoring
+        if !self.draw_batches.is_empty() {
+            log::debug!(
+                "Rendered {} batches with {} state changes (ratio: {:.2})",
+                self.draw_batches.len(),
+                state_changes,
+                state_changes as f32 / self.draw_batches.len() as f32
+            );
         }
         drop(rpass);
 
