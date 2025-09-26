@@ -12,7 +12,7 @@ use winit::{
     window::{Window, WindowId},
 };
 
-use asset::obj;
+use asset::{obj, texture::TextureData};
 use corelib::{
     camera::Camera,
     ecs::{MaterialId, MeshId, Renderable, World},
@@ -148,6 +148,27 @@ impl ApplicationHandler for App {
         };
         self.cube_mesh = cube_mesh;
         self.suzanne_mesh = suzanne_mesh;
+
+        // Load texture
+        let _default_texture = {
+            let texture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("..")
+                .join("assets")
+                .join("textures")
+                .join("default.png");
+            match TextureData::load_png(&texture_path) {
+                Ok(texture_data) => {
+                    log::info!("Loaded default texture from {:?}", texture_path);
+                    gpu.upload_texture("Default", &texture_data)
+                }
+                Err(err) => {
+                    log::warn!("Failed to load texture from {:?}: {err:?}", texture_path);
+                    log::info!("Using built-in checkerboard texture");
+                    gpu.default_texture_id()
+                }
+            }
+        };
 
         // Build scene: grid of cubes + Suzanne centerpiece
         self.world = World::new();

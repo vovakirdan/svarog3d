@@ -31,6 +31,19 @@ impl MaterialId {
     }
 }
 
+/// Handle for a texture stored on the GPU.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TextureId(pub u32);
+
+impl TextureId {
+    pub const INVALID: TextureId = TextureId(u32::MAX);
+
+    #[inline]
+    pub const fn new(raw: u32) -> Self {
+        Self(raw)
+    }
+}
+
 /// Marker component: renderable mesh + material handles.
 #[derive(Clone, Copy, Debug)]
 pub struct Renderable {

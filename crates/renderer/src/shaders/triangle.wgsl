@@ -5,6 +5,11 @@ struct Camera {
 @group(0) @binding(0)
 var<uniform> u_camera : Camera;
 
+@group(1) @binding(0)
+var t_diffuse: texture_2d<f32>;
+@group(1) @binding(1)
+var s_diffuse: sampler;
+
 struct VsIn {
     @location(0) pos    : vec3<f32>,
     @location(1) normal : vec3<f32>,
@@ -44,8 +49,11 @@ fn vs_main(in: VsIn) -> VsOut {
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let light_dir = normalize(vec3<f32>(-0.5, 1.0, -0.3));
     let ndotl = max(dot(in.normal, light_dir), 0.0);
-    let base_color = vec3<f32>(0.7, 0.7, 0.8);
-    let uv_tint = vec3<f32>(in.uv, 0.5);
-    let color = base_color * (0.3 + 0.7 * ndotl) + 0.1 * uv_tint;
-    return vec4<f32>(color, 1.0);
+
+    // Sample the diffuse texture
+    let texture_color = textureSample(t_diffuse, s_diffuse, in.uv);
+
+    // Apply simple directional lighting to the texture
+    let lit_color = texture_color.rgb * (0.3 + 0.7 * ndotl);
+    return vec4<f32>(lit_color, texture_color.a);
 }

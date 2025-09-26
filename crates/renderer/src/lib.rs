@@ -5,12 +5,15 @@ use std::num::NonZeroU64;
 use std::sync::Arc;
 use std::time::Instant;
 
-use asset::mesh::{MeshData, MeshVertex};
+use asset::{
+    mesh::{MeshData, MeshVertex},
+    texture::TextureData,
+};
 use bytemuck::{Pod, Zeroable};
 use corelib::{
     Mat4, Vec3,
     camera::Camera,
-    ecs::{MaterialId, MeshId},
+    ecs::{MaterialId, MeshId, TextureId},
     transform::Transform,
 };
 use wgpu::{
@@ -19,10 +22,10 @@ use wgpu::{
     CommandEncoderDescriptor, DepthBiasState, DepthStencilState, Device, Extent3d, FragmentState,
     Instance, InstanceDescriptor, LoadOp, Operations, PipelineLayoutDescriptor, PowerPreference,
     PresentMode, Queue, RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline,
-    RenderPipelineDescriptor, ShaderModuleDescriptor, ShaderSource, ShaderStages, StoreOp, Surface,
-    SurfaceConfiguration, SurfaceError, TextureDescriptor, TextureDimension, TextureFormat,
-    TextureUsages, TextureView, TextureViewDescriptor, VertexBufferLayout, VertexState,
-    VertexStepMode, util::DeviceExt,
+    RenderPipelineDescriptor, Sampler, SamplerDescriptor, ShaderModuleDescriptor, ShaderSource,
+    ShaderStages, StoreOp, Surface, SurfaceConfiguration, SurfaceError, Texture, TextureDescriptor,
+    TextureDimension, TextureFormat, TextureSampleType, TextureUsages, TextureView, TextureViewDescriptor,
+    TextureViewDimension, VertexBufferLayout, VertexState, VertexStepMode, util::DeviceExt,
 };
 use winit::{dpi::PhysicalSize, window::Window};
 
@@ -158,6 +161,82 @@ impl MeshStore {
     }
 }
 
+struct TextureGpu {
+    texture: Texture,
+    view: TextureView,
+    sampler: Sampler,
+}
+
+struct TextureStore {
+    textures: Vec<TextureGpu>,
+}
+
+impl TextureStore {
+    fn new() -> Self {
+        Self { textures: Vec::new() }
+    }
+
+    fn add_texture(&mut self, device: &Device, queue: &Queue, label: &str, data: &TextureData) -> TextureId {
+        assert!(data.is_valid(), "Texture data must be valid");
+
+        let texture = device.create_texture_with_data(
+            queue,
+            &wgpu::TextureDescriptor {
+                label: Some(&format!("{label} Texture")),
+                size: Extent3d {
+                    width: data.width,
+                    height: data.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rgba8UnormSrgb,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &data.data,
+        );
+
+        let view = texture.create_view(&TextureViewDescriptor {
+            label: Some(&format!("{label} TextureView")),
+            format: None,
+            dimension: Some(TextureViewDimension::D2),
+            aspect: wgpu::TextureAspect::All,
+            base_mip_level: 0,
+            mip_level_count: None,
+            base_array_layer: 0,
+            array_layer_count: None,
+            usage: None,
+        });
+
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let id_raw = u32::try_from(self.textures.len()).expect("Too many textures");
+        let id = TextureId::new(id_raw);
+        self.textures.push(TextureGpu {
+            texture,
+            view,
+            sampler,
+        });
+
+        id
+    }
+
+    fn get(&self, id: TextureId) -> Option<&TextureGpu> {
+        self.textures.get(id.0 as usize)
+    }
+}
+
 #[derive(Clone, Copy)]
 struct InstanceEntry {
     mesh: MeshId,
@@ -202,6 +281,8 @@ pub struct GpuState {
     pipeline: RenderPipeline,
     mesh_store: MeshStore,
     cube_mesh_id: MeshId,
+    texture_store: TextureStore,
+    default_texture_id: TextureId,
     instance_buf: Buffer,
     instance_capacity: u32,
     instance_count: u32,
@@ -218,6 +299,8 @@ pub struct GpuState {
     camera_bgl: BindGroupLayout,
     camera_bg: BindGroup,
     camera_buf: Buffer,
+    texture_bgl: BindGroupLayout,
+    texture_bg: BindGroup,
 
     // Depth
     depth_view: TextureView,
@@ -383,6 +466,51 @@ impl GpuState {
                 resource: camera_buf.as_entire_binding(),
             }],
         });
+
+        // Texture store with default texture
+        let mut texture_store = TextureStore::new();
+        let default_texture_data = TextureData::create_test_texture(64);
+        let default_texture_id = texture_store.add_texture(&device, &queue, "Default", &default_texture_data);
+
+        // Texture BGL/BG
+        let texture_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Texture BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: TextureViewDimension::D2,
+                        sample_type: TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let default_texture_gpu = texture_store.get(default_texture_id).expect("Default texture should exist");
+        let texture_bg = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Texture BG"),
+            layout: &texture_bgl,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&default_texture_gpu.view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&default_texture_gpu.sampler),
+                },
+            ],
+        });
+
         let instance_capacity = 0;
         let instance_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Instance Buffer"),
@@ -394,7 +522,7 @@ impl GpuState {
         // Pipeline
         let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Basic PipelineLayout"),
-            bind_group_layouts: &[&camera_bgl],
+            bind_group_layouts: &[&camera_bgl, &texture_bgl],
             push_constant_ranges: &[],
         });
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
@@ -459,9 +587,13 @@ impl GpuState {
             pipeline,
             mesh_store,
             cube_mesh_id,
+            texture_store,
+            default_texture_id,
             camera_bgl,
             camera_bg,
             camera_buf,
+            texture_bgl,
+            texture_bg,
             depth_view,
             start: Instant::now(),
             camera,
@@ -495,6 +627,16 @@ impl GpuState {
     /// Upload mesh data to the GPU mesh store and receive a [`MeshId`].
     pub fn upload_mesh(&mut self, label: &str, mesh: &MeshData) -> MeshId {
         self.mesh_store.add_mesh(&self.device, label, mesh)
+    }
+
+    /// Upload texture data to the GPU texture store and receive a [`TextureId`].
+    pub fn upload_texture(&mut self, label: &str, texture: &TextureData) -> TextureId {
+        self.texture_store.add_texture(&self.device, &self.queue, label, texture)
+    }
+
+    /// Get the default texture ID.
+    pub fn default_texture_id(&self) -> TextureId {
+        self.default_texture_id
     }
 
     /// Resize: reconfigure surface & recreate depth view.
@@ -643,6 +785,7 @@ impl GpuState {
 
         rpass.set_pipeline(&self.pipeline);
         rpass.set_bind_group(0, &self.camera_bg, &[]);
+        rpass.set_bind_group(1, &self.texture_bg, &[]);
 
         let pv = self.camera.proj_view();
         let mvp = OPENGL_TO_WGPU * pv;

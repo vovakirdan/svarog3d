@@ -6,3 +6,5 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+log.workspace = true
+image = { version = "0.25.5", default-features = false, features = ["png"] }
