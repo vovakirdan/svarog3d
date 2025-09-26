@@ -98,14 +98,133 @@
 
 ---
 
+## Блок I — Пользовательский интерфейс
+
+**I1. Интеграция egui**
+**Описание:** встроить immediate-mode GUI для инспекторов, настроек, иерархии сцены.
+**Ожидаемый результат:** overlay панели поверх 3D вида; регулировка параметров света/камеры в реальном времени, FPS counter в углу.
+
+**I2. Viewport и управление камерой**
+**Описание:** орбитальная камера (мышь + клавиши), pan/zoom, gizmo для трансформаций объектов.
+**Ожидаемый результат:** intuitive 3D navigation как в Blender/Unity; выделение объектов кликом, перемещение/поворот через визуальные handles.
+
+**I3. Иерархия сцены и инспектор**
+**Описание:** дерево объектов с возможностью выделения, переименования; панель свойств для Transform/Material.
+**Ожидаемый результат:** полноценный scene outliner; изменение параметров через UI мгновенно отражается в 3D виде.
+
+---
+
+## Блок J — Форматы и импорт
+
+**J1. Расширенный парсер моделей**
+**Описание:** поддержка FBX/glTF 2.0, анимации, multiple materials per mesh, иерархии костей.
+**Ожидаемый результат:** импорт сложных моделей из DCC tools (Blender/Maya); корректное отображение multiple materials и UV-каналов.
+
+**J2. Система материалов**
+**Описание:** node-based материалы или JSON-дескрипторы, библиотека preset'ов, hot-reload шейдеров.
+**Ожидаемый результат:** drag&drop текстур на материалы, live editing параметров без перекомпиляции приложения.
+
+**J3. Проектные файлы**
+**Описание:** сериализация/десериализация сцены (RON/JSON), система asset dependencies.
+**Ожидаемый результат:** сохранение/загрузка проектов, автоматический reimport при изменении source assets.
+
+---
+
+## Блок K — Рендеринг высокого качества
+
+**K1. Physically Based Rendering (PBR)**
+**Описание:** metallic/roughness workflow, IBL с environment maps, BRDF lookup tables.
+**Ожидаемый результат:** photorealistic материалы, HDR skybox, корректные отражения и subsurface scattering basics.
+
+**K2. Advanced Lighting**
+**Описание:** punctual lights (spot/point/directional), area lights, light probes, cascaded shadow maps.
+**Ожидаемый результат:** динамическое освещение multiple источников, soft shadows, indirect illumination approximation.
+
+**K3. Post-processing Pipeline**
+**Описание:** tone mapping, bloom, SSAO, temporal anti-aliasing (TAA), color grading.
+**Ожидаемый результат:** cinematic image quality, настраиваемые post-effect chains через FrameGraph.
+
+---
+
+## Блок L — Производительность и оптимизация
+
+**L1. Advanced Culling**
+**Описание:** frustum culling, occlusion culling с GPU queries, level-of-detail (LOD) system.
+**Ожидаемый результат:** stable 60+ FPS на сценах с тысячами объектов, automatic LOD transitions.
+
+**L2. GPU-Driven Rendering**
+**Описание:** indirect drawing, GPU culling через compute shaders, mesh shaders (если поддерживается).
+**Ожидаемый результат:** минимальный CPU overhead, масштабирование на large worlds без CPU bottleneck.
+
+**L3. Memory Management**
+**Описание:** streaming system для больших сцен, texture compression, geometry compression.
+**Ожидаемый результат:** поддержка multi-GB сцен при ограниченной VRAM, seamless loading/unloading.
+
+---
+
+## Блок M — Инструменты разработки
+
+**M1. Asset Pipeline**
+**Описание:** автоматическая конвертация FBX→optimized format, texture compression, dependency tracking.
+**Ожидаемый результат:** build system который обрабатывает изменения в source assets, optimal runtime formats.
+
+**M2. Debugging Tools**
+**Описание:** wireframe mode, normal visualization, light debugging, GPU profiler integration.
+**Ожидаемый результат:** visual debugging overlay, frame timing breakdowns, bottleneck identification.
+
+**M3. Scripting Integration**
+**Описание:** Lua/WASM scripting для game logic, hot-reload, visual scripting nodes (опционально).
+**Ожидаемый результат:** rapid prototyping без перекомпиляции, accessible для non-programmers.
+
+---
+
+## Блок N — Экосистема и распространение
+
+**N1. Plugin Architecture**
+**Описание:** динамическая загрузка модулей, stable API для external renderers/importers.
+**Ожидаемый результат:** third-party plugins расширяют функциональность, backward compatibility.
+
+**N2. Export и Integration**
+**Описание:** экспорт сцен в popular formats, headless rendering для automation, CLI interface.
+**Ожидаемый результат:** integration в production pipelines, batch processing, render farms compatibility.
+
+**N3. Documentation и Community**
+**Описание:** comprehensive docs, tutorials, example projects, contributor guidelines.
+**Ожидаемый результат:** accessible для новых пользователей, sustainable open-source project.
+
+---
+
 ## Контроль прогресса — вехи (быстрый чек-лист)
 
-* **M0:** Скелет репо собирается (`cargo run -p app`).
-* **M1:** Окно живёт/ресайзится (A1).
-* **M2:** Clear color + треугольник (B1–B2).
-* **M3:** Вращающийся куб с depth (B3, D1).
-* **M4:** Suzanne с текстурой (E1–E2).
-* **M5:** Свет/материалы (F2).
-* **M6:** Сцена из N мешей, стаб. FPS (D2, G1).
-* **M7:** Постпроц через мини-FrameGraph (G2).
-* **M8+:** Тени/PBR/профайлинг (H\*).
+### Фундаментальные возможности (Completed ✅)
+* **M0:** Скелет репо собирается (`cargo run -p app`). ✅
+* **M1:** Окно живёт/ресайзится (A1). ✅
+* **M2:** Clear color + треугольник (B1–B2). ✅
+* **M3:** Вращающийся куб с depth (B3, D1). ✅
+* **M4:** Suzanne с текстурой (E1–E2). ✅
+* **M5:** Свет/материалы (F2). ✅
+* **M6:** Сцена из N мешей, стаб. FPS (D2, G1). ✅
+* **M7:** Постпроц через мини-FrameGraph (G2). ✅
+
+### Расширенная графика
+* **M8:** Тени/PBR/профайлинг (H*).
+* **M9:** Орбитальная камера + basic UI (I1-I2).
+* **M10:** Иерархия сцены + инспектор (I3).
+
+### Профессиональные инструменты
+* **M11:** glTF импорт + multi-material (J1-J2).
+* **M12:** Проектные файлы + asset pipeline (J3, M1).
+* **M13:** Physically-based рендеринг (K1-K2).
+* **M14:** Post-processing chain (K3).
+
+### Производительность
+* **M15:** Advanced culling + LOD system (L1).
+* **M16:** GPU-driven rendering (L2).
+* **M17:** Streaming + memory management (L3).
+
+### Экосистема
+* **M18:** Debugging tools + profiler (M2).
+* **M19:** Scripting integration (M3).
+* **M20:** Plugin architecture (N1).
+* **M21:** Export pipeline + CLI (N2).
+* **M22:** Production-ready documentation (N3).
